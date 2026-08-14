@@ -113,7 +113,7 @@ class SharedContextCrossSplitPart:
                 if not tgts:
                     continue
                 most_common_tgt = Counter(tgts).most_common(1)[0][0]
-                final_entries.append(GlossaryEntry(src, most_common_tgt))
+                final_entries.append(GlossaryEntry(src, most_common_tgt, getattr(self, 'lang_out', None)))
 
             if final_entries:
                 self.auto_extracted_glossary = Glossary(
@@ -312,6 +312,7 @@ class TranslationConfig:
         self.doc_layout_model = doc_layout_model
 
         self.shared_context_cross_split_part = SharedContextCrossSplitPart()
+        self.shared_context_cross_split_part.lang_out = lang_out
         self.shared_context_cross_split_part.initialize_glossaries(
             initial_user_glossaries
         )
