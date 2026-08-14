@@ -8,7 +8,7 @@ from pathlib import Path
 
 __version__ = "0.6.4"
 
-CACHE_FOLDER = Path.home() / ".cache" / "babeldoc"
+CACHE_FOLDER = Path(__file__).resolve().parents[2] / "babeldoc_cache"
 
 
 def get_cache_file_path(filename: str, sub_folder: str | None = None) -> Path:
