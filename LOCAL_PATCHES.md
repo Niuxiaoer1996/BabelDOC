@@ -55,9 +55,10 @@
 
 ## 附：相关但未修改的上游问题
 
-- `warmup()` 一次性预下载全部字体，慢网环境拖慢启动——已在
+- `warmup()` 一次性预下载全部字体，慢网环境拖慢启动--已在
   PDFMathTranslate-next fork 中禁用调用（`pdf2zh_next/main.py`），
   BabelDOC 本体未改
-- `pdf2zh-next` 的 `high_level.py` 未把 `save_auto_extracted_glossary`
-  传给 BabelDOC config（BabelDOC 默认 True 掩盖了该问题）——
-  调用侧已显式传 `--save-auto-extracted-glossary` 规避
+- ~~`pdf2zh-next` 的 `high_level.py` 未把 `save_auto_extracted_glossary`
+  传给 BabelDOC config~~ --已根治：在 PDFMathTranslate-next fork 的
+  `high_level.py` 补转发该参数（详见该仓库 LOCAL_PATCHES.md 第 2 条，
+  双向验证通过）。BabelDOC 本体无需改动
