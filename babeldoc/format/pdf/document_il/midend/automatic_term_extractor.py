@@ -32,7 +32,7 @@ LLM_PROMPT_TEMPLATE: str = """
 You are an expert multilingual terminologist. Extract key terms from the text and translate them into {target_language}.
 
 ### Extraction Rules
-1. Include only: named entities (people, orgs, locations, theorem/algorithm names, dates) and domain-specific nouns/noun phrases essential to meaning.
+1. Include only: theorem/algorithm names and domain-specific nouns/noun phrases essential to meaning. Exclude person names, organization names, locations, and dates.
 2. No full sentences. Ignore function words.
 3. Use minimal noun phrases (≤5 words unless a named entity). No generic academic nouns (e.g., model, case, property) unless part of a standard term.
 4. No mathematical items: variables (X1, a, ε), symbols (=, +, →, ⊥⊥, ∈), subscripts/superscripts, formula fragments, mappings (T: H1→H2), etc. Keep only natural-language concepts.
