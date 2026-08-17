@@ -290,6 +290,10 @@ class ParagraphFinder:
         if getattr(self.translation_config, "merge_alternating_line_numbers", True):
             self.merge_alternating_line_number_paragraphs(paragraphs)
 
+        # 新增后处理：合并被版面模型误切分的句中续接段落（如图片旁正文被切成多块）
+        if getattr(self.translation_config, "merge_mid_sentence_paragraphs", True):
+            self.merge_mid_sentence_continuation_paragraphs(paragraphs)
+
         for paragraph in paragraphs:
             self.update_paragraph_data(paragraph, update_unicode=True)
 
@@ -416,6 +420,131 @@ class ParagraphFinder:
                     # 不移动 i，继续尝试把更多正文接到 a，实现 a l+ a l+ a ... 链式合并
                     continue
             i += 1
+
+    def _paragraph_last_char(self, p: PdfParagraph) -> str:
+        text = self._paragraph_text_ascii(p).rstrip()
+        return text[-1] if text else ""
+
+    def _paragraph_first_char(self, p: PdfParagraph) -> str:
+        text = self._paragraph_text_ascii(p).lstrip()
+        return text[0] if text else ""
+
+    @staticmethod
+    def _estimate_line_pitch(p: PdfParagraph) -> float | None:
+        """估算段落行距（相邻行中心的垂直间距中位数）。"""
+        lines = [
+            c.pdf_line for c in p.pdf_paragraph_composition or [] if c.pdf_line
+        ]
+        if not lines:
+            return None
+        if len(lines) >= 2:
+            centers = sorted((line.box.y + line.box.y2) / 2 for line in lines)
+            pitches = [b - a for a, b in zip(centers, centers[1:]) if b > a]
+            if pitches:
+                pitches.sort()
+                mid = len(pitches) // 2
+                return (
+                    pitches[mid]
+                    if len(pitches) % 2 == 1
+                    else (pitches[mid - 1] + pitches[mid]) / 2
+                )
+        return (lines[0].box.y2 - lines[0].box.y) * 1.5
+
+    @staticmethod
+    def _last_line_height(p: PdfParagraph) -> float | None:
+        for c in reversed(p.pdf_paragraph_composition or []):
+            if c.pdf_line:
+                return c.pdf_line.box.y2 - c.pdf_line.box.y
+        return None
+
+    @staticmethod
+    def _first_line_height(p: PdfParagraph) -> float | None:
+        for c in p.pdf_paragraph_composition or []:
+            if c.pdf_line:
+                return c.pdf_line.box.y2 - c.pdf_line.box.y
+        return None
+
+    def merge_mid_sentence_continuation_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """合并被版面模型误切分的“句中续接”段落。
+
+        版面模型有时会把一个连续段落（常见于图片旁的正文，布局检测被
+        图片干扰）在句中切成多个布局块。各块独立翻译、独立排版缩放后，
+        会出现字号缩小、块间空洞、译文截断在句中等排版劣化。
+
+        仅在严格条件下合并（保守策略，避免误合并真正的分段）：
+        - a 段末尾字符不是句末标点（. : ; ! ? 。：；！？）
+        - b 段以小写字母开头（句中续接特征）
+        - b 段无首行缩进（真分段通常缩进）
+        - 同列相邻：b 在 a 正下方，垂直间距 <= 1.3 倍行距
+        - 水平重叠超过较窄段落宽度的 50%
+        - 相同布局标签、相同 xobj、首尾行高比在 0.6~1.6 之间
+        """
+        if not paragraphs or len(paragraphs) < 2:
+            return
+        terminal = ".:;!?。：；！？"
+        i = 0
+        while i < len(paragraphs):
+            a = paragraphs[i]
+            merged = False
+            if a.box is not None:
+                last_ch = self._paragraph_last_char(a)
+                pitch = self._estimate_line_pitch(a)
+                h_a = self._last_line_height(a)
+                if (
+                    last_ch
+                    and last_ch not in terminal
+                    and pitch
+                    and pitch > 0
+                    and h_a
+                ):
+                    # 双栏渲染顺序中列表相邻 != 几何相邻，
+                    # 在全页段落中搜索 a 正下方几何最近的续接候选 b
+                    best_j, best_gap = None, float("inf")
+                    for j in range(len(paragraphs)):
+                        if j == i:
+                            continue
+                        b = paragraphs[j]
+                        if (
+                            b.box is None
+                            or a.xobj_id != b.xobj_id
+                            or (a.layout_label or "") != (b.layout_label or "")
+                            or b.first_line_indent
+                        ):
+                            continue
+                        first_ch = self._paragraph_first_char(b)
+                        h_b = self._first_line_height(b)
+                        if (
+                            not first_ch
+                            or not first_ch.isalpha()
+                            or not first_ch.islower()
+                            or not h_b
+                            or not 0.6 <= h_a / h_b <= 1.6
+                        ):
+                            continue
+                        gap = a.box.y - b.box.y2  # b 在 a 正下方
+                        x_overlap = min(a.box.x2, b.box.x2) - max(a.box.x, b.box.x)
+                        min_w = min(a.box.x2 - a.box.x, b.box.x2 - b.box.x)
+                        if (
+                            min_w > 0
+                            and x_overlap > 0.5 * min_w
+                            and -2 <= gap <= pitch * 1.3
+                            and gap < best_gap
+                        ):
+                            best_j, best_gap = j, gap
+                    if best_j is not None:
+                        b = paragraphs[best_j]
+                        a.pdf_paragraph_composition.extend(
+                            b.pdf_paragraph_composition
+                        )
+                        self.update_paragraph_data(a)
+                        del paragraphs[best_j]
+                        merged = True
+                        logger.info(
+                            "Merged mid-sentence continuation paragraph"
+                            f" {b.debug_id} into {a.debug_id}."
+                        )
+            if not merged:
+                i += 1
 
     def _group_characters_into_paragraphs(
         self, page: Page, layout_index, layout_map
