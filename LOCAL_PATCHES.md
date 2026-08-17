@@ -5,7 +5,7 @@
 
 ## 1. 自动术语表 tgt_lng 列始终为空
 
-- **Commit**: `ac2eaa5`
+- **Commit**: `2d0b508`
 - **症状**: v2 翻译产物 `xxx.zh.glossary.csv` 的 `tgt_lng` 列全为空
 - **根因**: `format/pdf/translation_config.py` 中
   `SharedContextCrossSplitPart` 不持有 `lang_out` 属性；
@@ -21,7 +21,7 @@
 
 ## 2. 资产缓存目录硬编码到用户主目录
 
-- **Commit**: `710cfe6`
+- **Commit**: `9ec9119`
 - **动机**: 自包含部署——字体/CMap/版面模型缓存（约 336MB）默认在
   `~/.cache/babeldoc`，整个项目目录搬迁后需手动恢复缓存
 - **修复**: `babeldoc/const.py` 的 `CACHE_FOLDER` 改为
@@ -34,7 +34,7 @@
 
 ## 3. 排版扩容缺少图片/矢量图阻挡检查，导致译文跨列压图
 
-- **Commit**: `c5bf464`
+- **Commit**: `cdc3c5a`
 - **症状**: 两列学术论文（如 jun2017 HBM 论文），某段中文译文不保持
   原列宽，横跨整页宽度（最高达页宽 81%），与相邻列图片重叠，
   文字被图片遮住不可读
