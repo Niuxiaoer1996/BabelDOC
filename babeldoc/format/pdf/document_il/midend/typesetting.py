@@ -1622,6 +1622,22 @@ class Typesetting:
                 figure.box.y >= current_box.y2 or figure.box.y2 <= current_box.y
             ):
                 max_x = min(max_x, figure.box.x)
+        # 检查表单对象（图片 XObject 等，form_type="image"，见 il_creater）
+        for form in page.pdf_form:
+            if form.box is None:
+                continue
+            if form.box.x > current_box.x and not (
+                form.box.y >= current_box.y2 or form.box.y2 <= current_box.y
+            ):
+                max_x = min(max_x, form.box.x)
+        # 检查矢量曲线（图表边框、坐标轴等）
+        for curve in page.pdf_curve:
+            if curve.box is None:
+                continue
+            if curve.box.x > current_box.x and not (
+                curve.box.y >= current_box.y2 or curve.box.y2 <= current_box.y
+            ):
+                max_x = min(max_x, curve.box.x)
 
         return max_x
 
@@ -1658,6 +1674,22 @@ class Typesetting:
                 figure.box.x >= current_box.x2 or figure.box.x2 <= current_box.x
             ):
                 min_y = max(min_y, figure.box.y2)
+        # 检查表单对象（图片 XObject 等，form_type="image"，见 il_creater）
+        for form in page.pdf_form:
+            if form.box is None:
+                continue
+            if form.box.y2 < current_box.y and not (
+                form.box.x >= current_box.x2 or form.box.x2 <= current_box.x
+            ):
+                min_y = max(min_y, form.box.y2)
+        # 检查矢量曲线（图表边框、坐标轴等）
+        for curve in page.pdf_curve:
+            if curve.box is None:
+                continue
+            if curve.box.y2 < current_box.y and not (
+                curve.box.x >= current_box.x2 or curve.box.x2 <= current_box.x
+            ):
+                min_y = max(min_y, curve.box.y2)
 
         return min_y
 
