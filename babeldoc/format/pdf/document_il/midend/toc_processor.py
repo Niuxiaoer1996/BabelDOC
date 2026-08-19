@@ -265,15 +265,20 @@ class TOCProcessor:
         if hdr_len:
             header_end = title_s + hdr_len
 
-        # 2) 行内裸整数编号剥离到布局段
+        # 2) 行内数字编号剥离到布局段
+        #    包括纯整数（1、2）和带点编号（6.5、6.7.1.1、13.5.4）
+        #    这样标题段只保留纯标题文字，box 从标题列（如 x=112）开始，
+        #    typesetting 排版时所有标题文字从统一位置起始，与原文对齐。
+        #    Table/Figure 编号不剥离（LLM 需翻译 Table->表、Figure->图）。
         inline_num_end = header_end
         rest = text[header_end:title_e]
         rest_clean = rest.lstrip()
         rest_lead = len(rest) - len(rest_clean)
         if not _INLINE_WORD_NUM_RE.match(rest_clean):
             m3 = _INLINE_NUM_RE.match(rest_clean)
-            if m3 and re.fullmatch(r"\d+", m3.group("num")):
-                inline_num_end = header_end + rest_lead + m3.end("num")
+            if m3:  # 剥离所有数字编号（含带点编号如 6.5、6.7.1.1）
+                # 用 start("title") 跳过编号和中间空格，标题段从标题文字开始
+                inline_num_end = header_end + rest_lead + m3.start("title")
 
         title_chars = chars[inline_num_end:title_e]
         layout_chars = list(chars[leader_s:page_e])
@@ -421,11 +426,11 @@ class TOCProcessor:
     # 归一化
     # ------------------------------------------------------------------
     def normalize_boxes(self):
-        """统一同一目录行标题段/布局段的 y 基准。
+        """统一同一目录行标题段/布局段的 y 基准，并扩展标题段宽度。
 
-        多行标题（标题折行）的标题段字符横跨两行，update_paragraph_data 会把
-        box 撑成两行高，导致排版从最后一行起排；这里把标题段压回单行：
-        y = 首字符顶边，y2 = 首字符顶边 + 布局段行高。
+        - y 基准：多行标题压回单行（锚定首行），单行标题与布局段共用 y。
+        - x 宽度：标题段 box.x2 扩展到布局段（点线/页码）左边界前 2pt，
+          给 typesetting 足够宽度排版标题文字，避免缩字号或折行。
         """
         for title_para, layout_para in self._pairs:
             if not title_para.box or not layout_para.box:
@@ -441,12 +446,14 @@ class TOCProcessor:
             min_y, max_y2 = min(ys), max(y2s)
             if (max_y2 - min_y) > line_h * 1.5:
                 # 多行标题（目录标题折行后续接合并）：锚定最上方行
-                # （IL 为底上坐标，y 越大越靠上；标题首行在点线行上方）
                 top_line_bottom = max(ys)
                 title_para.box.y = top_line_bottom
                 title_para.box.y2 = top_line_bottom + line_h
             else:
-                # 单行标题：与同行的布局段（点线/页码）共用同一 y 基准，
-                # 使译文标题基线与 passthrough 的点线/页码严格对齐
+                # 单行标题：与同行的布局段（点线/页码）共用同一 y 基准
                 title_para.box.y = layout_para.box.y
                 title_para.box.y2 = layout_para.box.y2
+            # 扩展标题段 x2 到布局段（点线/页码）左边界前 2pt
+            # 避免标题文字被缩字号（如 13.5.4 MBIST 被缩到 sz=4）
+            if layout_para.box.x > title_para.box.x:
+                title_para.box.x2 = max(title_para.box.x2, layout_para.box.x - 2)
