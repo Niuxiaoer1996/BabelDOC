@@ -36,6 +36,7 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import is_cid_paragr
 from babeldoc.format.pdf.document_il.utils.style_helper import INDIGO
 from babeldoc.format.pdf.document_il.utils.style_helper import WHITE
 from babeldoc.format.pdf.translation_config import TranslationConfig
+from babeldoc.format.pdf.document_il.midend.toc_processor import TOCProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -286,16 +287,33 @@ class ParagraphFinder:
         # 第五步：处理独立段落
         self.process_independent_paragraphs(paragraphs, median_width)
 
+        # 目录页结构化处理：把目录条目拆成"标题段（可译）+ 布局段（passthrough）"
+        # 必须在行号/句中合并之前执行；目录页跳过下述两个合并（避免编号被并进
+        # 标题后误译、以及两行标题被重新并成带点线的整段）。
+        toc_processor = TOCProcessor(self.translation_config)
+        toc_page = toc_processor.process(page)
+        paragraphs = page.pdf_paragraph
+
         # 新增后处理：合并带行号交替的正文段落（a 正文、b 行号、c 正文 -> 合并 a 与 c，保留 b）
-        if getattr(self.translation_config, "merge_alternating_line_numbers", True):
+        if (
+            not toc_page
+            and getattr(self.translation_config, "merge_alternating_line_numbers", True)
+        ):
             self.merge_alternating_line_number_paragraphs(paragraphs)
 
         # 新增后处理：合并被版面模型误切分的句中续接段落（如图片旁正文被切成多块）
-        if getattr(self.translation_config, "merge_mid_sentence_paragraphs", True):
+        if (
+            not toc_page
+            and getattr(self.translation_config, "merge_mid_sentence_paragraphs", True)
+        ):
             self.merge_mid_sentence_continuation_paragraphs(paragraphs)
 
         for paragraph in paragraphs:
             self.update_paragraph_data(paragraph, update_unicode=True)
+
+        # 目录页：统一标题段/布局段的 y 基准（多行标题压回单行）
+        if toc_page:
+            toc_processor.normalize_boxes()
 
         if self.translation_config.ocr_workaround:
             self.add_text_fill_background(page)
@@ -1090,6 +1108,13 @@ class ParagraphFinder:
                     para2 = paragraphs[j]
 
                     if para1.box is None or para2.box is None:
+                        continue
+
+                    # 目录页的标题段/布局段同处一行，属于同一目录条目的两个部分，
+                    # 不参与垂直避让调整（否则会把布局段挤下一行）。
+                    if getattr(para1, "toc_role", None) or getattr(
+                        para2, "toc_role", None
+                    ):
                         continue
 
                     if para1.xobj_id != para2.xobj_id:

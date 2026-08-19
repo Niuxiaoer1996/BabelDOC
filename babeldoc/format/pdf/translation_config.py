@@ -206,6 +206,7 @@ class TranslationConfig:
         enable_graphic_element_process: bool = True,
         merge_alternating_line_numbers: bool = True,
         merge_mid_sentence_paragraphs: bool = True,
+        fix_toc: bool = True,
         skip_translation: bool = False,
         skip_form_render: bool = False,
         skip_curve_render: bool = False,
@@ -274,6 +275,7 @@ class TranslationConfig:
         self.ocr_workaround = ocr_workaround
         self.merge_alternating_line_numbers = merge_alternating_line_numbers
         self.merge_mid_sentence_paragraphs = merge_mid_sentence_paragraphs
+        self.fix_toc = fix_toc
 
         if self.ocr_workaround:
             self.skip_scanned_detection = True

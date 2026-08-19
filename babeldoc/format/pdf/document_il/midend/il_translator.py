@@ -585,6 +585,11 @@ class ILTranslator:
         if is_pure_numeric_paragraph(paragraph):
             return None
 
+        # Skip TOC layout paragraphs (dot leaders / page numbers / bare numbers).
+        # 目录页布局段：编号/点引导线/页码不送 LLM，保持原始字符 passthrough。
+        if getattr(paragraph, "toc_role", None) == "layout":
+            return None
+
         # Skip paragraphs with only placeholders
         if is_placeholder_only_paragraph(paragraph):
             return None

@@ -337,6 +337,13 @@ def create_parser():
         help="Disable post-processing that merges alternating line-number layouts (by default this feature is enabled).",
     )
     translation_group.add_argument(
+        "--no-fix-toc",
+        action="store_false",
+        dest="fix_toc",
+        default=True,
+        help="Disable TOC (table of contents / list of figures / list of tables) page restructure (by default this feature is enabled).",
+    )
+    translation_group.add_argument(
         "--skip-translation",
         action="store_true",
         default=False,
@@ -728,6 +735,7 @@ async def main():
             save_auto_extracted_glossary=args.save_auto_extracted_glossary,
             enable_graphic_element_process=not args.disable_graphic_element_process,
             merge_alternating_line_numbers=args.merge_alternating_line_numbers,
+            fix_toc=args.fix_toc,
             skip_translation=args.skip_translation,
             skip_form_render=args.skip_form_render,
             skip_curve_render=args.skip_curve_render,

@@ -1172,6 +1172,9 @@ class Typesetting:
             for i, p_upper in para_map.items():
                 if not (p_upper.box and p_upper.box.y is not None):
                     continue
+                # 目录页的标题段/布局段不参与避让调整（同处一行的两个部分）
+                if getattr(p_upper, "toc_role", None):
+                    continue
 
                 # Calculate paragraph height and set required gap accordingly
                 para_height = p_upper.box.y2 - p_upper.box.y
@@ -1191,6 +1194,8 @@ class Typesetting:
                     if para_id == i:
                         continue
                     p_lower = para_map[para_id]
+                    if getattr(p_lower, "toc_role", None):
+                        continue
                     if not (
                         p_lower.box
                         and p_upper.box

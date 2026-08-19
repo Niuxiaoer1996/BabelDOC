@@ -1214,6 +1214,17 @@ class PdfParagraph:
             "type": "Attribute",
         },
     )
+    # TOC（目录页）条目角色：
+    #   "title"  -> 目录条目的标题段（送 LLM 翻译，正常流式排版）
+    #   "layout" -> 目录条目的布局段（编号/点引导线/页码，不翻译，passthrough 原坐标）
+    #   None     -> 普通段落
+    toc_role: str | None = field(
+        default=None,
+        metadata={
+            "name": "tocRole",
+            "type": "Attribute",
+        },
+    )
     debug_id: str | None = field(
         default=None,
         metadata={

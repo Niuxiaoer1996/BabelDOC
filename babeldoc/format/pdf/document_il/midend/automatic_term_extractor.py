@@ -246,6 +246,10 @@ class AutomaticTermExtractor:
             if is_placeholder_only_paragraph(paragraph):
                 pbar.advance(1)
                 continue
+            # 目录页布局段（点引导线/页码）不参与术语提取
+            if getattr(paragraph, "toc_role", None) == "layout":
+                pbar.advance(1)
+                continue
             # if len(paragraph.unicode) < self.translation_config.min_text_length:
             #     pbar.advance(1)
             #     continue
