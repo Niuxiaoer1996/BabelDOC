@@ -395,9 +395,20 @@ class TOCProcessor:
             title_chars = self._para_chars(title_para)
             if not title_chars:
                 continue
-            top_y = min(self._char_box(c).y for c in title_chars)
             line_h = layout_para.box.y2 - layout_para.box.y
             if line_h <= 0:
                 line_h = 13.0
-            title_para.box.y = top_y
-            title_para.box.y2 = top_y + line_h
+            ys = [self._char_box(c).y for c in title_chars]
+            y2s = [self._char_box(c).y2 for c in title_chars]
+            min_y, max_y2 = min(ys), max(y2s)
+            if (max_y2 - min_y) > line_h * 1.5:
+                # 多行标题（目录标题折行后续接合并）：锚定最上方行
+                # （IL 为底上坐标，y 越大越靠上；标题首行在点线行上方）
+                top_line_bottom = max(ys)
+                title_para.box.y = top_line_bottom
+                title_para.box.y2 = top_line_bottom + line_h
+            else:
+                # 单行标题：与同行的布局段（点线/页码）共用同一 y 基准，
+                # 使译文标题基线与 passthrough 的点线/页码严格对齐
+                title_para.box.y = layout_para.box.y
+                title_para.box.y2 = layout_para.box.y2
