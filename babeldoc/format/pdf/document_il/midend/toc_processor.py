@@ -205,37 +205,67 @@ class TOCProcessor:
         )
         return para
 
+    def _iter_entry_spans(self, text: str):
+        """从左到右扫描文本，产出每个目录条目的
+        (title_s, title_e, leader_s, leader_e, page_e) 绝对下标。
+
+        处理 layout 模型把多个相邻条目合并进同一段落的情况（标题内嵌
+        "点线+页码+下一条目"，如 "Figure 28 ... 52 Figure 29 ... 7"）。
+        """
+        pos = 0
+        n = len(text)
+        while pos < n:
+            m = _ENTRY_RE.match(text[pos:])
+            if not m:
+                break
+            title_s = pos + m.start("title")
+            title_e = pos + m.end("title")
+            leader_s = pos + m.start("leader")
+            leader_e = pos + m.end("leader")
+            page_e = pos + m.end("page")
+            # 标题内嵌另一条目的点线（两条目合并成一段）
+            inner = _LEADER_RUN.search(text[title_s:title_e])
+            if inner:
+                inner_s = title_s + inner.start()
+                inner_e = title_s + inner.end()
+                m2 = re.match(r"\s*(\d+)", text[inner_e:])
+                if m2:
+                    first_page_e = inner_e + m2.end()
+                    yield (title_s, inner_s, inner_s, inner_e, first_page_e)
+                    pos = first_page_e
+                    continue
+            yield (title_s, title_e, leader_s, leader_e, page_e)
+            pos = page_e
+
     def _split_entry(
         self,
         chars: list[il_version_1.PdfCharacter],
         text: str,
-        lead: int,
-        m: re.Match,
+        title_s: int,
+        title_e: int,
+        leader_s: int,
+        leader_e: int,
+        page_e: int,
         base: il_version_1.PdfParagraph,
     ) -> tuple[
         list[il_version_1.PdfCharacter],
         list[il_version_1.PdfCharacter],
         list[il_version_1.PdfCharacter],
     ]:
-        """拆分完整条目 -> (标题字符, 布局字符, 页眉字符)。
+        """拆分一个目录条目（绝对文本下标）-> (标题字符, 布局字符, 页眉字符)。
 
-        坐标约定：text 为原始字符串（含首尾空白），m 匹配自 strip 后的文本，
-        因此 m 中的下标 + lead 才是 text 的下标。
+        - 页眉前缀（"Contents (cont'd)" 等）剥离为独立普通段；
+        - 行内裸整数编号（"1 Scope ...." 中的 "1"）剥离到布局段；
+        - "Table N -"/"Figure N -"/"6.2.1.1" 等前缀留在标题段（LLM 可靠保留/本地化）。
         """
-        title_s = m.start("title") + lead
-        title_e = m.end("title") + lead
-        leader_s = m.start("leader") + lead
-        page_e = m.end("page") + lead
-
-        # 1) 页眉前缀剥离（如 "Contents (cont'd) Table 46 – ..."）
+        # 1) 页眉前缀剥离
         header_end = title_s
         title_part = text[title_s:title_e]
         hdr_len = self._match_header_prefix(title_part)
         if hdr_len:
             header_end = title_s + hdr_len
 
-        # 2) 行内裸整数编号剥离到布局段（"1 Scope ...." -> 布局段收走 "1"）
-        #    "Table N -"/"Figure N -"/"6.2.1.1" 等前缀留在标题段（LLM 可靠保留/本地化）
+        # 2) 行内裸整数编号剥离到布局段
         inline_num_end = header_end
         rest = text[header_end:title_e]
         rest_clean = rest.lstrip()
@@ -326,39 +356,47 @@ class TOCProcessor:
                 result.append(para)
                 continue
 
-            # 3) 完整条目：标题 + 点线 + 页码
-            m = _ENTRY_RE.match(stripped)
-            if m:
-                title_chars, layout_chars, header_chars = self._split_entry(
-                    chars, text, lead, m, para
-                )
-                # 多行标题续接：把上方同列的续接行并入标题
-                while title_chars and result:
-                    prev = result[-1]
-                    first = title_chars[0]
-                    entry_title_x = self._char_box(first).x
-                    entry_y = self._char_box(first).y
-                    if not self._is_continuation_candidate(prev, entry_title_x, entry_y):
-                        break
-                    prev_chars, _ = self._para_chars_text(prev)
-                    result.pop()
-                    title_chars = prev_chars + title_chars
+            # 3) 完整条目：标题 + 点线 + 页码（layout 模型可能把多条相邻条目
+            #    合并进同一段落，逐条拆分）
+            spans = list(self._iter_entry_spans(text))
+            if spans:
+                for idx, (title_s, title_e, leader_s, leader_e, page_e) in enumerate(spans):
+                    title_chars, layout_chars, header_chars = self._split_entry(
+                        chars, text, title_s, title_e, leader_s, leader_e, page_e, para
+                    )
+                    # 多行标题续接：把上方同列的续接行并入标题（仅第一条目）
+                    if idx == 0:
+                        while title_chars and result:
+                            prev = result[-1]
+                            first = title_chars[0]
+                            entry_title_x = self._char_box(first).x
+                            entry_y = self._char_box(first).y
+                            if not self._is_continuation_candidate(
+                                prev, entry_title_x, entry_y
+                            ):
+                                break
+                            prev_chars, _ = self._para_chars_text(prev)
+                            result.pop()
+                            title_chars = prev_chars + title_chars
 
-                if header_chars:
-                    result.append(self._build_paragraph(header_chars, para, None))
+                    if header_chars:
+                        result.append(self._build_paragraph(header_chars, para, None))
 
-                if title_chars and layout_chars:
-                    title_para = self._build_paragraph(title_chars, para, "title")
-                    layout_para = self._build_paragraph(layout_chars, para, "layout")
-                    result.append(title_para)
-                    result.append(layout_para)
-                    self._pairs.append((title_para, layout_para))
-                elif title_chars:
-                    # 只有标题（理论少见）
-                    result.append(self._build_paragraph(title_chars, para, "title"))
-                elif layout_chars:
-                    para.toc_role = "layout"
-                    result.append(para)
+                    if title_chars and layout_chars:
+                        title_para = self._build_paragraph(title_chars, para, "title")
+                        layout_para = self._build_paragraph(
+                            layout_chars, para, "layout"
+                        )
+                        result.append(title_para)
+                        result.append(layout_para)
+                        self._pairs.append((title_para, layout_para))
+                    elif title_chars:
+                        # 只有标题（理论少见）
+                        result.append(self._build_paragraph(title_chars, para, "title"))
+                    elif layout_chars:
+                        result.append(
+                            self._build_paragraph(layout_chars, para, "layout")
+                        )
                 continue
 
             # 4) 标题 + 尾部孤立点线（页码/点线在下一段）：剥掉尾部点
