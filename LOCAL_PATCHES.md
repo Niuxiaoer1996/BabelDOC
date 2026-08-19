@@ -100,6 +100,53 @@
 - **上游价值**: 属上游普适缺陷（任何"图片旁正文被句中切断"场景），
   修复侵入性中等，可考虑提 PR
 
+## 6. 目录页（TOC / List of Tables / List of Figures）条目结构化处理
+
+- **Commit**: `2ff2271`
+- **症状**: 目录行被当作普通段落整体送 LLM 翻译，四个问题：
+  1. 章节/表/图编号被误译：裸整数 "1" 被并进标题段后 LLM 译成
+     "页码1"（`merge_alternating_line_number_paragraphs` 只识别
+     纯数字段，带点的 "3.1" 反而不合并，行为不一致）
+  2. 点引导线丢失/错乱：LLM 随意处理点线，且两条翻译路径都有
+     `re.sub(r"[. 。…，]{20,}", ".", ...)`（`il_translator.py`
+     L1263 / `il_translator_llm_only.py` L754），把保留的点线压成单点
+  3. 页码不再右对齐：`typesetting.py` 是纯流式布局，无右对齐机制
+  4. 页眉（"Contents (cont'd)"、"Page" 等）被 layout 模型合并进条目
+- **根因**: 引擎没有"目录页"概念，目录行与正文走完全相同的
+  "段落合并 -> LLM 翻译 -> 流式排版"链路
+- **修复**（方案 B，引擎内结构化处理）:
+  - 新增 `midend/toc_processor.py`（`TOCProcessor`）：
+    - 按 markers（Contents / List of Figures / List of Tables）+
+      点线行密度检测目录页
+    - 把每个目录条目拆成**标题段**（`toc_role="title"`，含 inline 的
+      "Table N -"/"6.2.1.1" 前缀，LLM 可可靠本地化/保留）与
+      **布局段**（`toc_role="layout"`：点引导线 + 页码 + 被剥离的
+      裸整数编号，不送 LLM，typesetting passthrough 按原始字符坐标
+      渲染 -> 点线保留、页码右对齐天然成立）
+    - 多行标题续接合并（目录标题折行时把上方同列续接行并入标题段）
+    - "Contents (cont'd)"/"Page(s)" 等页眉前缀从被 layout 合并的
+      条目中剥离为独立普通段（正常翻译）
+  - `il_version_1.py`：`PdfParagraph` 新增 `toc_role` 字段
+  - `paragraph_finder.py`：目录页跳过
+    `merge_alternating_line_number_paragraphs` 与
+    `merge_mid_sentence_continuation_paragraphs`；
+    `fix_overlapping_paragraphs` 跳过 toc 段；
+    处理末尾 `normalize_boxes()` 统一标题段/布局段 y 基准
+  - `il_translator.py`（`get_translate_input`，两条路径共用）与
+    `automatic_term_extractor.py`：跳过 `toc_role="layout"` 段落
+  - `typesetting.py`：`render_page` 的段落避让调整跳过 toc 段
+  - `translation_config.py` / `main.py`：新增 `fix_toc` 开关
+    （默认开启，CLI `--no-fix-toc`）；pdf2zh-next fork 的
+    `high_level.py` 已转发该参数（`no_fix_toc`）
+- **验证**: JESD238B.01 目录 10 页重译：章节编号原样（裸整数在布局段
+  passthrough、"Table/Figure N" 由 LLM 本地化为 表N/图N）、点引导线
+  完整、页码右对齐到原右缘（x2≈540）、"Contents (cont'd)" 等页眉
+  正常翻译为"目录（续）"；`fix_toc.py` 后处理脚本与 v2_run.py 的
+  `restore_toc_pages` 贴回逻辑随即退役
+- **上游价值**: 属上游普适缺陷（任何带点引导线的目录页），修复侵入性
+  中等，可提 PR；注意与 `merge_alternating_line_number_paragraphs`
+  的交互需保留目录页跳过逻辑
+
 ## 附：相关但未修改的上游问题
 
 - `warmup()` 一次性预下载全部字体，慢网环境拖慢启动--已在
