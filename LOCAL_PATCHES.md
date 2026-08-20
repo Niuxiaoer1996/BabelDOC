@@ -151,9 +151,46 @@
   条目（如 Figure 28+29、Figure 108+109+110、Table 19+20）——
   `_iter_entry_spans` 从左到右扫描，标题内嵌"点线+页码+下一条目"时在
   第一个内嵌点线处截断；JESD238B.01 三处合并全部拆开
+- **后续提交**: `29974d2` 目录页标题对齐+字号优化——`_split_entry` 剥离
+  所有数字编号（含带点的 `6.5`/`13.5.4`，用 `m3.start("title")` 跳过前导
+  空格），标题段 box 从标题列 x=112 开始；`normalize_boxes` 扩展 `box.x2`
+  到布局段左边界前 2pt。验证：13.5.4 从 sz=4 恢复正常 sz=9，标题统一 x=112
+- **后续提交**: `7cfed40` 目录页标题重合修复——`normalize_boxes` 对单行标题
+  不再强制覆盖 `layout_para.box.y`，保持原文 y，避免长标题折行后与相邻条目重叠
 - **上游价值**: 属上游普适缺陷（任何带点引导线的目录页），修复侵入性
   中等，可提 PR；注意与 `merge_alternating_line_number_paragraphs`
   的交互需保留目录页跳过逻辑
+
+## 7. LLM 把富文本标签 <style> 翻译成 <样式>，导致标签无法解析
+
+- **Commit**: `e69ecec`
+- **症状**: 使用中文模型（SiliconFlowFree 等）翻译时，BabelDOC 用
+  `<style id='N'>` 作为富文本占位标签，LLM 把 "style" 译成 "样式"，
+  输出 `<样式id='N'>`/`</样式>`，引擎无法识别标签，富文本（粗体等）
+  样式失效，且标签名泄漏到译文
+- **根因**: `il_translator_llm_only.py` 的翻译结果后处理只清理了
+  超长标点，没有防护标签被本地化
+- **修复**: 翻译结果后处理（`il_translator_llm_only.py` L753 附近）追加
+  `re.sub(r"<样式\s*", "<style ", ...)` + `replace("</样式>", "</style>")`
+- **验证**: v2-verify2 全产物无 `<样式` 泄漏
+- **上游价值**: 属上游普适缺陷（任何会把 style 本地化的 LLM），可提 PR
+
+## 8. 表格同列多行单元格被重新并段，导致列内容挤压（配合开关）
+
+- **背景**: `--no-merge-mid-sentence` 开关由 PDFMathTranslate-next fork
+  新增（见该仓库 LOCAL_PATCHES.md），BabelDOC 侧无需改代码——
+  `translation_config.py` 本就持有 `merge_mid_sentence_paragraphs` 配置，
+  `paragraph_finder.py:307` 也已按配置跳过合并
+- **症状**: 表3/表6 这类表格，同列多行的时序参数（如 `t_RC...`/`t_CCDL...`
+  /`t_RFC...`）被 `merge_mid_sentence_continuation_paragraphs` 并回一段，
+  译文流式重排后全部挤到表格顶部，不再对齐所属行标签
+- **根因**: 合并条件是"上段无句末标点 + 下段小写开头 + 垂直相邻"，
+  表格单元格行恰好满足（`t_xxx` 开头、无句号），被误判为"句中续接"
+- **修复**: 关闭该合并（CLI 开关），配合 `--split-short-lines` 让表格行
+  保持独立段落、保留原始 y 对齐
+- **验证**: JESD238B.01 表3/表6 行对齐恢复，问题2 bullet 列表换行也顺带修复
+- **注意**: 副作用是"图片旁正文被句中切断"场景（补丁5 修复目标）不再自动
+  合并；若需两者兼顾，应实现 table_processor 精确方案（仅对表格区域拆段）
 
 ## 附：相关但未修改的上游问题
 
