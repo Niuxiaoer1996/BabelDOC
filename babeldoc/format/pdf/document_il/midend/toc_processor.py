@@ -428,7 +428,9 @@ class TOCProcessor:
     def normalize_boxes(self):
         """统一同一目录行标题段/布局段的 y 基准，并扩展标题段宽度。
 
-        - y 基准：多行标题压回单行（锚定首行），单行标题与布局段共用 y。
+        - y 基准：多行标题压回单行（锚定首行）；单行标题保持原文 y 坐标不变
+          （标题段和布局段在原文中本就同行，y 相同，无需强制覆盖；
+          强制覆盖反而会导致不同条目的标题被压到同一 y，造成重叠）。
         - x 宽度：标题段 box.x2 扩展到布局段（点线/页码）左边界前 2pt，
           给 typesetting 足够宽度排版标题文字，避免缩字号或折行。
         """
@@ -449,10 +451,9 @@ class TOCProcessor:
                 top_line_bottom = max(ys)
                 title_para.box.y = top_line_bottom
                 title_para.box.y2 = top_line_bottom + line_h
-            else:
-                # 单行标题：与同行的布局段（点线/页码）共用同一 y 基准
-                title_para.box.y = layout_para.box.y
-                title_para.box.y2 = layout_para.box.y2
+            # 单行标题：保持原文 y 坐标不变，不强制对齐布局段
+            # （标题段和布局段在原文中本就同行，y 坐标相同，
+            #   强制覆盖 layout_para.box.y 可能导致不同条目标题重叠）
             # 扩展标题段 x2 到布局段（点线/页码）左边界前 2pt
             # 避免标题文字被缩字号（如 13.5.4 MBIST 被缩到 sz=4）
             if layout_para.box.x > title_para.box.x:
