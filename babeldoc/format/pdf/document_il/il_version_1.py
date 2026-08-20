@@ -1225,6 +1225,11 @@ class PdfParagraph:
             "type": "Attribute",
         },
     )
+    # 表格感知标记：段落中心是否落在任一 "table" 版面框内。
+    # 为 True 时跳过"句中续接段落"合并，保持表格每行独立（运行时标记，不参与序列化）。
+    in_table_layout: bool = field(
+        default=False,
+    )
     debug_id: str | None = field(
         default=None,
         metadata={

@@ -294,6 +294,21 @@ class ParagraphFinder:
         toc_page = toc_processor.process(page)
         paragraphs = page.pdf_paragraph
 
+        # 表格感知：标记落在 table 版面框内的段落，使"句中续接"合并跳过它们。
+        # 表格单元格行（通常是独立的 fallback_line 段落）满足 merge 的"上段无句末
+        # 标点 + 下段小写开头"条件，会被误判为"句中续接"并回一段，导致表格同列
+        # 多行内容在译文流式重排时挤压到表格顶部。逐段落按中心点是否落在任一
+        # "table" 版面框内判定。
+        table_boxes = [
+            layout.box
+            for layout in page.page_layout
+            if layout.class_name == "table" and layout.box is not None
+        ]
+        for paragraph in paragraphs:
+            paragraph.in_table_layout = self._is_in_table_layout(
+                paragraph, table_boxes
+            )
+
         # 新增后处理：合并带行号交替的正文段落（a 正文、b 行号、c 正文 -> 合并 a 与 c，保留 b）
         if (
             not toc_page
@@ -420,6 +435,10 @@ class ParagraphFinder:
         i = 0
         while i < len(paragraphs) - 2:
             a = paragraphs[i]
+            # 表格区段落不参与行号交替合并（表格单元格行应保持独立）
+            if getattr(a, "in_table_layout", False):
+                i += 1
+                continue
             # 吞掉一个或多个连续的行号段 l
             j = i + 1
             saw_l = False
@@ -431,7 +450,9 @@ class ParagraphFinder:
             # 现在 j 指向候选的 c
             if saw_l and j < len(paragraphs):
                 c = paragraphs[j]
-                if self._same_layout_and_xobj(a, c):
+                if not getattr(c, "in_table_layout", False) and self._same_layout_and_xobj(
+                    a, c
+                ):
                     a.pdf_paragraph_composition.extend(c.pdf_paragraph_composition)
                     self.update_paragraph_data(a)
                     del paragraphs[j]
@@ -482,6 +503,23 @@ class ParagraphFinder:
                 return c.pdf_line.box.y2 - c.pdf_line.box.y
         return None
 
+    def _is_in_table_layout(
+        self, paragraph: PdfParagraph, table_boxes: list[Box]
+    ) -> bool:
+        """判断段落是否落在任一 table 版面框内。
+
+        以段落 box 中心点是否被某个 "table" 版面框包含为准。表格区单元格行
+        （fallback_line）会被归为 True，从而跳过"句中续接"合并，保持每行独立。
+        """
+        if not table_boxes or paragraph.box is None:
+            return False
+        cx = (paragraph.box.x + paragraph.box.x2) / 2
+        cy = (paragraph.box.y + paragraph.box.y2) / 2
+        for box in table_boxes:
+            if box.x <= cx <= box.x2 and box.y <= cy <= box.y2:
+                return True
+        return False
+
     def merge_mid_sentence_continuation_paragraphs(self, paragraphs: list[PdfParagraph]):
         """合并被版面模型误切分的“句中续接”段落。
 
@@ -503,6 +541,11 @@ class ParagraphFinder:
         i = 0
         while i < len(paragraphs):
             a = paragraphs[i]
+            # 表格区段落不参与"句中续接"合并：表格单元格行本应每行独立，
+            # 若被误并成一段，译文流式重排会挤压到表格顶部，丢失行对齐。
+            if getattr(a, "in_table_layout", False):
+                i += 1
+                continue
             merged = False
             if a.box is not None:
                 last_ch = self._paragraph_last_char(a)
@@ -524,6 +567,7 @@ class ParagraphFinder:
                         b = paragraphs[j]
                         if (
                             b.box is None
+                            or getattr(b, "in_table_layout", False)
                             or a.xobj_id != b.xobj_id
                             or (a.layout_label or "") != (b.layout_label or "")
                             or b.first_line_indent
