@@ -753,6 +753,16 @@ class ILTranslatorLLMOnly:
                     # Clean up any excessive punctuation in the translated text
                     translated_text = re.sub(r"[. 。…，]{20,}", ".", output)
 
+                    # 修复 LLM 把 <style id='N'> 翻译成 <样式id='N'> 的问题
+                    # BabelDOC 用 <style id='N'> 作为富文本标签，LLM 翻译时
+                    # 可能把 "style" 译成 "样式"，导致标签无法被引擎解析
+                    translated_text = re.sub(
+                        r"<样式\s*", "<style ", translated_text
+                    )
+                    translated_text = translated_text.replace(
+                        "</样式>", "</style>"
+                    )
+
                     # Get the original input for this translation
                     translate_input = inputs[id_][1]
                     llm_translate_tracker = inputs[id_][4]
