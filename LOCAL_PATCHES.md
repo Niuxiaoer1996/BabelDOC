@@ -192,6 +192,33 @@
 - **注意**: 副作用是"图片旁正文被句中切断"场景（补丁5 修复目标）不再自动
   合并；若需两者兼顾，应实现 table_processor 精确方案（仅对表格区域拆段）
 
+## 9. 引擎级 References/Bibliography 参考文献不翻译
+
+- **Commit**: `31249b4`
+- **症状**: 学术论文的 References 章节被翻译成中文（如 jun2017：
+  `[1] JEDEC标准高带宽内存...`、electronics-14-02682：
+  `1. Jun, H.; ...` 被译成中文）。common_rules.md 已有"References
+  不翻译"提示词规则，但弱模型 LLM（SiliconFlowFree 等）常忽略
+- **根因**: 提示词规则依赖模型遵守，免费弱模型不可靠；引擎没有
+  "参考文献"概念，参考文献段与普通正文走相同翻译链路
+- **修复**（`paragraph_finder.py` + 两条 translator 路径）:
+  - `ParagraphFinder._mark_reference_paragraphs`：检测
+    `REFERENCES`/`References`/`BIBLIOGRAPHY` 标题段后，其下方
+    （IL y 更小）以 `[N]`（IEEE 风格）或 `N.`（MDPI/Elsevier 风格）
+    开头的段落标记 `skip_translate=True`
+  - 跨页延续：`ParagraphFinder._in_references` 实例状态跨页跟踪，
+    上页处于参考文献模式时，后续页以 `[N]`/`N.` 开头的段落继续标记
+  - `il_translator.py`（`get_translate_input`）与
+    `il_translator_llm_only.py`（`process_page`）跳过 `skip_translate`
+    段落，保持原文 passthrough
+  - `il_version_1.py`：`PdfParagraph` 新增 `skip_translate` 运行时标记
+  - 注意：调用时机在 `update_paragraph_data(update_unicode=True)` 之前，
+    段落 unicode 未填充，需用 `_para_text` 从 composition 拼文本
+- **验证**: jun2017 REFERENCES 页 `[1]`/`[3]` 标记成功；electron
+  文档 References（`1.` 格式）单页及跨页（33-37）全部标记，正文/
+  作者贡献/Disclaimer 不受影响
+- **上游价值**: 属上游普适缺陷（任何学术论文），可考虑提 PR
+
 ## 附：相关但未修改的上游问题
 
 - `warmup()` 一次性预下载全部字体，慢网环境拖慢启动--已在
