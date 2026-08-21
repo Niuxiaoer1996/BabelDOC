@@ -590,6 +590,11 @@ class ILTranslator:
         if getattr(paragraph, "toc_role", None) == "layout":
             return None
 
+        # Skip reference entries (References/Bibliography items starting with "[N]").
+        # 参考文献条目：引擎级检测标记，保持原文 passthrough（弱模型常忽略提示词规则）。
+        if getattr(paragraph, "skip_translate", False):
+            return None
+
         # Skip paragraphs with only placeholders
         if is_placeholder_only_paragraph(paragraph):
             return None

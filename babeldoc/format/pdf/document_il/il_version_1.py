@@ -1230,6 +1230,11 @@ class PdfParagraph:
     in_table_layout: bool = field(
         default=False,
     )
+    # 参考文献跳过翻译标记：References/Bibliography 章节条目（以 "[N]" 开头）为 True，
+    # 翻译器跳过该段落，保持原文 passthrough（运行时标记，不参与序列化）。
+    skip_translate: bool = field(
+        default=False,
+    )
     debug_id: str | None = field(
         default=None,
         metadata={

@@ -578,6 +578,14 @@ class ILTranslatorLLMOnly:
                     pbar.advance(1)
                 continue
 
+            # 参考文献条目（References/Bibliography，以 "[N]" 开头）：
+            # 引擎级检测标记，跳过翻译，保持原文 passthrough
+            # （弱模型 LLM 常忽略提示词中"参考文献不翻译"的规则）。
+            if getattr(paragraph, "skip_translate", False):
+                if pbar:
+                    pbar.advance(1)
+                continue
+
             # self.translate_paragraph(paragraph, pbar,tracker.new_paragraph(), page_font_map, page_xobj_font_map)
             total_token_count += self.calc_token_count(paragraph.unicode)
             paragraphs.append(paragraph)

@@ -57,6 +57,8 @@ class ParagraphFinder:
     def __init__(self, translation_config: TranslationConfig):
         self.translation_config = translation_config
         self.font_mapper = FontMapper(translation_config)
+        # 参考文献模式状态：跨页跟踪（上一页处于 REFERENCES 章节）
+        self._in_references = False
 
     def _preprocess_formula_layouts(self, page: Page):
         """
@@ -309,6 +311,12 @@ class ParagraphFinder:
                 paragraph, table_boxes
             )
 
+        # 参考文献（References/Bibliography）章节检测：
+        # 检测到 "REFERENCES" 标题段后，其下方以 "[N]" 开头的段落标记为
+        # skip_translate（翻译器跳过，保留原文 passthrough）。弱模型 LLM 常忽略
+        # 提示词中"参考文献不翻译"的规则，引擎级检测才能可靠保证。
+        self._mark_reference_paragraphs(paragraphs)
+
         # 新增后处理：合并带行号交替的正文段落（a 正文、b 行号、c 正文 -> 合并 a 与 c，保留 b）
         if (
             not toc_page
@@ -519,6 +527,86 @@ class ParagraphFinder:
             if box.x <= cx <= box.x2 and box.y <= cy <= box.y2:
                 return True
         return False
+
+    # 参考文献标题（大小写不敏感，允许行尾空白）
+    _REFERENCE_HEADER_RE = re.compile(
+        r"^\s*(?:REFERENCES?|BIBLIOGRAPHY)\s*$", re.IGNORECASE
+    )
+    # 参考文献条目：段落首字符为 "[N]" 或 "N."（两种常见格式）
+    #   - IEEE 风格: "[1] JEDEC Standard High Bandwidth Memory..."
+    #   - MDPI/Elsevier 风格: "1. Jun, H.; Cho, J.; Lee, K.; ..."
+    _REFERENCE_ENTRY_RE = re.compile(r"^\s*(?:\[\d+\]|\d+\.\s)")
+
+    def _mark_reference_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """标记 References/Bibliography 章节条目为 skip_translate。
+
+        - 本页检测到 "REFERENCES"/"References"/"BIBLIOGRAPHY" 标题段 -> 进入参考文献
+          模式，其下（IL y 更小，即视觉下方）以 "[N]" 或 "N." 开头的段落标记
+          skip_translate
+        - 跨页：上一页处于参考文献模式时，本页顶部以 "[N]"/"N." 开头的段落继续标记
+        - 标题本身不标记（正常翻译为"参考文献"）
+        - 注意：调用时机在 update_paragraph_data(update_unicode=True) 之前，
+          段落的 unicode 属性尚未填充，需从 composition 自行拼接文本。
+        """
+        # 1) 本页是否有 REFERENCES 标题段
+        found_header = False
+        for para in paragraphs:
+            text = self._para_text(para).strip()
+            if text and self._REFERENCE_HEADER_RE.match(text):
+                found_header = True
+                break
+
+        if found_header:
+            self._in_references = True
+        elif not self._in_references:
+            # 不在参考文献模式，本页无标题 -> 无操作
+            return
+
+        # 2) 标记以 "[N]"/"N." 开头的段落
+        #    IL 坐标 y 向上为正（大=视觉上方）。REFERENCES 标题上方是正文，
+        #    标题下方（y 更小）才是参考文献条目。跨页模式（标题在上页）时
+        #    标记整页的 "[N]"/"N." 段落。
+        header_y = None
+        if found_header:
+            for para in paragraphs:
+                text = self._para_text(para).strip()
+                if text and self._REFERENCE_HEADER_RE.match(text) and para.box is not None:
+                    header_y = para.box.y
+                    break
+
+        for para in paragraphs:
+            text = self._para_text(para).strip()
+            if not text or not self._REFERENCE_ENTRY_RE.match(text):
+                continue
+            if found_header and header_y is not None and para.box is not None:
+                # IL 坐标：y 向上为正（大=视觉上方）。REFERENCES 标题上方是正文，
+                # 标题下方才是参考文献条目。仅标记标题下方（y <= header_y）的条目。
+                if para.box.y > header_y:
+                    continue
+            para.skip_translate = True
+
+        # 3) 跨页续接判断：若本页有以 "[N]"/"N." 开头的段落（说明仍在参考文献），保持模式
+        has_entry = any(
+            self._REFERENCE_ENTRY_RE.match(self._para_text(p).strip())
+            for p in paragraphs
+        )
+        if not has_entry and not found_header:
+            self._in_references = False
+
+    @staticmethod
+    def _para_text(paragraph: PdfParagraph) -> str:
+        """从段落 composition 拼接文本（在 update_unicode 之前可用）。"""
+        if paragraph.unicode:
+            return paragraph.unicode
+        chars = []
+        for comp in paragraph.pdf_paragraph_composition or []:
+            if comp.pdf_line:
+                chars.extend(comp.pdf_line.pdf_character)
+            elif comp.pdf_character:
+                chars.append(comp.pdf_character)
+            elif comp.pdf_formula:
+                chars.extend(comp.pdf_formula.pdf_character)
+        return get_char_unicode_string(chars)
 
     def merge_mid_sentence_continuation_paragraphs(self, paragraphs: list[PdfParagraph]):
         """合并被版面模型误切分的“句中续接”段落。
