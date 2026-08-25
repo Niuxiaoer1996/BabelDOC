@@ -157,9 +157,20 @@
   到布局段左边界前 2pt。验证：13.5.4 从 sz=4 恢复正常 sz=9，标题统一 x=112
 - **后续提交**: `7cfed40` 目录页标题重合修复——`normalize_boxes` 对单行标题
   不再强制覆盖 `layout_para.box.y`，保持原文 y，避免长标题折行后与相邻条目重叠
-- **上游价值**: 属上游普适缺陷（任何带点引导线的目录页），修复侵入性
-  中等，可提 PR；注意与 `merge_alternating_line_number_paragraphs`
-  的交互需保留目录页跳过逻辑
+- **后续提交**: `4e4dada` 目录续页识别（多页目录中不带 Contents marker 的续页）——
+  原 `is_toc_page` 只认"页内含 Contents/List of Tables/List of Figures marker 且
+  点线行数>=3"的页；JESD238B 的目录续页恰好每页重复 `Contents (cont'd)` 所以被覆盖，
+  但 NsightCompute 第3页、NsightSystems 第3-7页的目录续页**不重复任何 marker**，
+  导致续页不被识别为目录页，条目被当普通正文整体送 LLM 翻译（点线丢失、页码不再
+  右对齐、编号混进标题，如 `6.3.指标与单位.58`）。修复：给 `TOCProcessor` 增加
+  跨页目录状态 `_in_toc`（由 `ParagraphFinder` 持有，参照参考文献跨页方案补丁9），
+  `process()` 维护状态：本页点线行数 >= `_TOC_MIN_DOTTED_LINES`(3) 且（命中 marker
+  或上一页已在目录模式）→ 判为目录页并延续模式；点线行数 < 3 → 退出目录模式。
+  双保险避免正文误判：无 marker 的续页必须以上一页在目录模式为前提。验证：
+  NsightCompute 第3页（32/32）、NsightSystems 第3-7页（含点线=4 的目录尾页第7页）
+  点线保留、页码右对齐 x≈540；回归 JESD238B.01 十页全部正常
+- **上游价值**: 属上游普适缺陷（任何"多页目录续页不带重复标题"的文档，
+  如 NVIDIA 系列 User Guide），可提 PR
 
 ## 7. LLM 把富文本标签 <style> 翻译成 <样式>，导致标签无法解析
 
