@@ -219,6 +219,43 @@
   作者贡献/Disclaimer 不受影响
 - **上游价值**: 属上游普适缺陷（任何学术论文），可考虑提 PR
 
+## 10. 清理 LLM 输出的空 <sub>/<sup> 标签 + 度符号归一化 + 下标公式占位符回填
+
+- **Commit**: `c9ee0bf`
+- **症状**: 译文正文出现 `SiO<sub></sub>`/`mm<sup></sup>` 空上下标标签
+  （MDPI 论文第 9/10 页），以及 `14 ◦℃`/`°C℃` 双度符号
+- **根因（部分）**:
+  1. 源文档用 `◦`(U+25E6) 表示度；`styles_and_formulas` 把 `◦C`/下标数字
+     （如 SiO2 的 "2"）误判为公式占位符 `{vN}`
+  2. 模型输出 `<sub>{vN}</sub>` 时，`parse_translate_output` 把内层 `{vN}`
+     当富文本内容，经 `remove_placeholder` 删除 -> 回填变空，留下 `<sub></sub>`
+- **修复**（`il_translator.py` + `paragraph_finder.py`）:
+  - `paragraph_finder.process_page`：源字符 `◦`→`°` 归一化
+  - `il_translator.get_translate_input`：同上（占位符回填/未译直出路径）
+  - `il_translator.parse_translate_output`：新增 `inner_formula`——富文本标签
+    内部若为公式占位符 `{vN}`，回填公式内容而非删除（修复 `SiO2`→`SiO` 丢下标）
+  - `il_translator.post_translate_paragraph`：新增清理管线
+    1) strip 空 `<sub></sub>`/`<sup></sup>`
+    2) `◦℃`/`◦C`/`°℃`→`℃` 归一化
+    3) 兜底循环：删空 composition、跨 composition 空标签剔除、度符号合并
+    4) 最终兜底：完整拼接文本检测到 `◦℃` 等度符号双写则重建纯文本
+  - `paragraph_finder.merge_title_caption_and_table_fragments`（新增）：
+    合并同一行水平切分的标题/图题片段，解决英文残留/译文逐词碎片化
+- **验证**: electronics 全量 `sub_empty`/`sup_empty` = 0；单页 p9 IL 层
+  `formula '2'` 保留、渲染 `SiO2` 完整
+- **已知未解决（重要）**:
+  1. **标签对含内容时仍以字面量显示**：`<sub>2</sub>`（非空）不会转为
+     真下标，而是作为字面量 `<sub>2</sub>` 渲染在文档中，不符合要求
+  2. **空标签根因未完全消除**：`<sub>{vN}</sub>` 的回填在
+     `parse_translate_output`（清理之前）发生，空标签的"是否保留下标内容"
+     依赖模型是否输出下标数字；模型随机漏掉下标时（`SiO2`→`SiO`）无法恢复。
+     属于引擎级 + 模型质量双重因素，后续需在 typesetting 层面或占位符回填
+     机制上根治
+  3. **p32 `200 ◦℃与℃之间`**：模型随机垃圾输出，该段落会进
+     `post_translate_paragraph`，清理逻辑理论上能兜住，但需多次全量验证稳定性
+- **上游价值**: 空标签/双度符号属上游普适缺陷，可考虑提 PR；但"标签对有内容
+  仍字面量显示"的根治需更深引擎改动，暂以本补丁缓解
+
 ## 附：相关但未修改的上游问题
 
 - `warmup()` 一次性预下载全部字体，慢网环境拖慢启动--已在
