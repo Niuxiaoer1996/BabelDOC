@@ -84,16 +84,37 @@ _HEADER_PATTERNS = [
 # 目录页判定 markers（源 PDF 侧）
 _TOC_MARKERS = ("Contents", "List of Figures", "List of Tables")
 
+# 目录续页判定：一页至少要有这么多行点线才可能被当作目录页（或目录续页）。
+# 太低会把含零星点线的正文（代码示例/表格）误判；太高会漏掉条目少的目录尾页。
+_TOC_MIN_DOTTED_LINES = 3
+
 
 class TOCProcessor:
     """目录页结构化处理器。"""
 
-    def __init__(self, translation_config):
+    def __init__(self, translation_config, toc_state: dict | None = None):
         self.translation_config = translation_config
+        # 跨页目录状态（由 ParagraphFinder 持有、跨页共享）：{"in_toc": bool}。
+        # 用于识别"多页目录中不带 Contents marker 的续页"（如 NsightCompute 第3页、
+        # NsightSystems 第3-7页），仅当上一页已是目录页时才放行无 marker 的续页，
+        # 避免正文页被误判。
+        self._toc_state = toc_state
         # 每页的 (标题段, 布局段) 配对，供 normalize_boxes 统一 y 基准
         self._pairs: list[
             tuple[il_version_1.PdfParagraph, il_version_1.PdfParagraph]
         ] = []
+
+    def _count_dotted_lines(self, page: il_version_1.Page) -> int:
+        """统计页面上包含点引导线（3+ 连续点）的行数。"""
+        n = 0
+        for para in page.pdf_paragraph or []:
+            chars = self._para_chars(para)
+            if not chars:
+                continue
+            text = "".join(c.char_unicode for c in chars)
+            if _LEADER_RUN.search(text):
+                n += 1
+        return n
 
     # ------------------------------------------------------------------
     # 字符/文本工具
@@ -147,22 +168,37 @@ class TOCProcessor:
     # ------------------------------------------------------------------
     # 目录页检测
     # ------------------------------------------------------------------
-    def is_toc_page(self, page: il_version_1.Page) -> bool:
+    def is_toc_page(
+        self,
+        page: il_version_1.Page,
+        prev_in_toc: bool = False,
+        dotted_lines: int | None = None,
+    ) -> bool:
+        """判断是否为目录页（或目录续页）。
+
+        - 首目录页：页面含 "Contents / List of Tables / List of Figures" marker
+          且点线行数 >= _TOC_MIN_DOTTED_LINES。
+        - 目录续页：多页目录中不带 marker 的续页（如 NsightCompute 第3页、
+          NsightSystems 第3-7页），仅当上一页已在目录模式（prev_in_toc）且本页
+          点线行数 >= _TOC_MIN_DOTTED_LINES 时判定为目录页。
+        - 点线行数 < _TOC_MIN_DOTTED_LINES 的页不可能是目录页（含目录尾页之后
+          的正文过渡页）。
+        """
         if not page.pdf_paragraph:
             return False
+        if dotted_lines is None:
+            dotted_lines = self._count_dotted_lines(page)
+        if dotted_lines < _TOC_MIN_DOTTED_LINES:
+            return False
         text_parts: list[str] = []
-        dotted_lines = 0
         for para in page.pdf_paragraph:
             chars = self._para_chars(para)
             if not chars:
                 continue
-            text = "".join(c.char_unicode for c in chars)
-            text_parts.append(text)
-            if _LEADER_RUN.search(text):
-                dotted_lines += 1
+            text_parts.append("".join(c.char_unicode for c in chars))
         text = "\n".join(text_parts).replace("\x03", "").lower()
         has_marker = any(m.lower() in text for m in _TOC_MARKERS)
-        return has_marker and dotted_lines >= 3
+        return has_marker or prev_in_toc
 
     # ------------------------------------------------------------------
     # 页眉前缀
@@ -323,10 +359,27 @@ class TOCProcessor:
     # 主入口
     # ------------------------------------------------------------------
     def process(self, page: il_version_1.Page) -> bool:
-        """重组目录页段落。返回 True 表示该页被当作目录页处理。"""
+        """重组目录页段落。返回 True 表示该页被当作目录页处理。
+
+        跨页状态维护：本页点线行数 < _TOC_MIN_DOTTED_LINES 时退出目录模式
+        （目录结束、进入正文）；否则若命中 marker 或上一页已在目录模式则
+        进入/延续目录模式。
+        """
         if not getattr(self.translation_config, "fix_toc", True):
             return False
-        if not self.is_toc_page(page):
+
+        dotted_lines = self._count_dotted_lines(page)
+        if self._toc_state is not None:
+            prev_in_toc = bool(self._toc_state.get("in_toc", False))
+            if dotted_lines < _TOC_MIN_DOTTED_LINES:
+                # 目录结束（进入正文过渡页），退出目录模式
+                if prev_in_toc:
+                    self._toc_state["in_toc"] = False
+                return False
+            if not self.is_toc_page(page, prev_in_toc, dotted_lines):
+                return False
+            self._toc_state["in_toc"] = True
+        elif not self.is_toc_page(page):
             return False
 
         self._pairs = []

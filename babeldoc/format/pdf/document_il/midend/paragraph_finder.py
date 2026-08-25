@@ -59,6 +59,9 @@ class ParagraphFinder:
         self.font_mapper = FontMapper(translation_config)
         # 参考文献模式状态：跨页跟踪（上一页处于 REFERENCES 章节）
         self._in_references = False
+        # 目录模式状态：跨页跟踪（多页目录中不带 marker 的续页，如 NsightCompute
+        # 第3页、NsightSystems 第3-7页，需在上一页是目录页时延续处理）
+        self._in_toc = False
 
     def _preprocess_formula_layouts(self, page: Page):
         """
@@ -299,8 +302,11 @@ class ParagraphFinder:
         # 目录页结构化处理：把目录条目拆成"标题段（可译）+ 布局段（passthrough）"
         # 必须在行号/句中合并之前执行；目录页跳过下述两个合并（避免编号被并进
         # 标题后误译、以及两行标题被重新并成带点线的整段）。
-        toc_processor = TOCProcessor(self.translation_config)
+        # 传入跨页目录状态，使不带 marker 的目录续页也能被识别处理。
+        _toc_state = {"in_toc": self._in_toc}
+        toc_processor = TOCProcessor(self.translation_config, _toc_state)
         toc_page = toc_processor.process(page)
+        self._in_toc = bool(_toc_state.get("in_toc", False))
         paragraphs = page.pdf_paragraph
 
         # 表格感知：标记落在 table 版面框内的段落，使"句中续接"合并跳过它们。
