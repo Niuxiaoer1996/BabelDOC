@@ -236,6 +236,13 @@ class ParagraphFinder:
         )
 
     def process_page(self, page: Page):
+        # 源文档（多为 MDPI）用 U+25E6 '◦'（白色圆圈）表示度符号。
+        # 归一化为标准度符号 U+00B0 '°'，避免占位符回填/未译直出时出现
+        # "◦℃" 双度符号（LLM 常把 '◦C' 的 C 译成 ℃ 而保留 ◦）。
+        for char in page.pdf_character:
+            cu = char.char_unicode
+            if cu and "\u25e6" in cu:
+                char.char_unicode = cu.replace("\u25e6", "\u00b0")
         layout_index, layout_map = build_layout_index(page)
         # 预处理公式布局的标签
         self._preprocess_formula_layouts(page)
@@ -323,6 +330,13 @@ class ParagraphFinder:
             and getattr(self.translation_config, "merge_alternating_line_numbers", True)
         ):
             self.merge_alternating_line_number_paragraphs(paragraphs)
+
+        # 新增后处理：合并同一行被水平切分的标题/图题片段，以及表格单元格内的垂直多行
+        if (
+            not toc_page
+            and getattr(self.translation_config, "merge_mid_sentence_paragraphs", True)
+        ):
+            self.merge_title_caption_and_table_fragments(paragraphs)
 
         # 新增后处理：合并被版面模型误切分的句中续接段落（如图片旁正文被切成多块）
         if (
@@ -607,6 +621,88 @@ class ParagraphFinder:
             elif comp.pdf_formula:
                 chars.extend(comp.pdf_formula.pdf_character)
         return get_char_unicode_string(chars)
+
+    def merge_title_caption_and_table_fragments(
+        self, paragraphs: list[PdfParagraph]
+    ):
+        """合并同一行被水平切分的标题/图题片段。
+
+        版面模型常把标题/图题的首行切成多个水平相邻片段
+        （例如表题 "Table 1. Thermal..." 被切成 "Table 1. T" + "hermal..." +
+        "uctures."，节标题被切成 "2.6. Research" + "Advances..."）。各片段独立
+        翻译后会出现英文残留（如 "T"/"chnology"）、译文逐词对应等碎片化问题。
+        这里做保守的水平合并：
+          - b 紧贴 a 右侧且与 a 处于同一行、a 结尾非句末
+          - b 以小写字母开头（句中续接特征）任何布局标签均可
+          - 或 a、b 均为标题类短片段（title/table_caption/figure_caption/fallback_line）
+        均要求同 xobj、b 无首行缩进。
+        """
+        if not paragraphs or len(paragraphs) < 2:
+            return
+        title_like = {"title", "table_caption", "figure_caption", "fallback_line"}
+        terminal = ".:;!?。：；！？"
+
+        i = 0
+        while i < len(paragraphs):
+            a = paragraphs[i]
+            if a.box is None or getattr(a, "in_table_layout", False):
+                i += 1
+                continue
+            last_ch = self._paragraph_last_char(a)
+            if not last_ch or last_ch in terminal:
+                i += 1
+                continue
+            if getattr(a, "toc_role", None) == "layout":
+                i += 1
+                continue
+            a_cy = (a.box.y + a.box.y2) / 2
+            best_j, best_gap = None, float("inf")
+            for j in range(len(paragraphs)):
+                if j == i:
+                    continue
+                b = paragraphs[j]
+                if (
+                    b.box is None
+                    or getattr(b, "in_table_layout", False)
+                    or a.xobj_id != b.xobj_id
+                    or b.first_line_indent
+                    or getattr(b, "toc_role", None) == "layout"
+                ):
+                    continue
+                b_cy = (b.box.y + b.box.y2) / 2
+                if abs(a_cy - b_cy) > 4.0:  # 同一行
+                    continue
+                h_gap = b.box.x - a.box.x2  # b 紧贴 a 右侧
+                if not (-0.5 <= h_gap <= 4.0):
+                    continue
+                first_ch = self._paragraph_first_char(b)
+                if not first_ch:
+                    continue
+                a_label = a.layout_label or ""
+                b_label = b.layout_label or ""
+                is_lower_cont = first_ch.islower()
+                is_title_pair = (
+                    a_label in title_like
+                    and b_label in title_like
+                    and first_ch.isalpha()
+                    and len((a.unicode or "")) <= 60
+                    and len((b.unicode or "")) <= 80
+                )
+                if not (is_lower_cont or is_title_pair):
+                    continue
+                if abs(h_gap) < best_gap:
+                    best_j, best_gap = j, abs(h_gap)
+            if best_j is not None:
+                b = paragraphs[best_j]
+                a.pdf_paragraph_composition.extend(b.pdf_paragraph_composition)
+                self.update_paragraph_data(a)
+                del paragraphs[best_j]
+                logger.info(
+                    "Merged horizontal fragment"
+                    f" {b.debug_id} into {a.debug_id}."
+                )
+                continue  # 尝试继续把更右的片段并入
+            i += 1
 
     def merge_mid_sentence_continuation_paragraphs(self, paragraphs: list[PdfParagraph]):
         """合并被版面模型误切分的“句中续接”段落。

@@ -739,6 +739,13 @@ class ILTranslator:
                 return self.get_translate_input(paragraph, page_font_map, True)
 
         text = get_char_unicode_string(chars)
+        # 归一化源字符里的 "◦"(U+25E6，MDPI 用它表示度) 为标准度符号 "°"。
+        # 占位符回填/未译直出都会引用这些 PdfCharacter 对象，若不在此处归一化，
+        # 模型输出 "℃" 时会把源 "◦" 一并保留，形成 "◦℃" 双度符号。
+        for _c in chars:
+            if hasattr(_c, "char_unicode") and _c.char_unicode and "\u25e6" in _c.char_unicode:
+                _c.char_unicode = _c.char_unicode.replace("\u25e6", "\u00b0")
+        text = get_char_unicode_string(chars)
         translate_input = self.TranslateInput(text, placeholders, paragraph.pdf_style)
         translate_input.set_original_placeholder_tokens(original_placeholder_tokens)
         return translate_input
@@ -920,6 +927,18 @@ class ILTranslator:
                     re.IGNORECASE,
                 ).group(1)
 
+                # 富文本标签（如 <sub>/<sup>）内部若恰好是公式占位符（如 {v7}，
+                # 源 "SiO2" 的 "2" 被 styles_and_formulas 识别为公式），应回填公式
+                # 内容而不是被 remove_placeholder 删除。否则模型输出 "<sub>{v7}</sub>"
+                # 时回填变空，丢下标数字（SiO2 -> SiO）。
+                inner_formula = None
+                for _ph in input_text.placeholders:
+                    if isinstance(_ph, FormulaPlaceholder) and re.match(
+                        f"^{_ph.regex_pattern}$", text, re.IGNORECASE
+                    ):
+                        inner_formula = _ph
+                        break
+
                 if isinstance(
                     placeholder.composition,
                     PdfSameStyleCharacters,
@@ -932,6 +951,8 @@ class ILTranslator:
                     comp = PdfParagraphComposition(
                         pdf_same_style_characters=placeholder.composition,
                     )
+                elif inner_formula is not None:
+                    comp = PdfParagraphComposition(pdf_formula=inner_formula.formula)
                 else:
                     comp = PdfParagraphComposition()
                     comp.pdf_same_style_unicode_characters = (
@@ -1007,6 +1028,19 @@ class ILTranslator:
     ):
         """Post-translation processing: update paragraph with translated text."""
         tracker.set_output(translated_text)
+        # 清理 LLM 输出的空上/下标标签（如 SiO<sub></sub>），避免原文直出
+        # （LLM 常把下标数字漏掉后只剩空标签，这里统一剔除，保证 <sub>2</sub> 等
+        #   非空标签不受影响）
+        translated_text = re.sub(
+            r"<(?:sub|sup)>\s*</(?:sub|sup)>", "", translated_text
+        )
+        # 源文档（多为 MDPI）用 U+25E6 '◦'（白色圆圈）表示度符号，LLM 常把它
+        # 连同 ℃ 一起输出（如 "14 ◦℃"）。这里统一归一化，避免度符号重复。
+        translated_text = (
+            translated_text.replace("◦℃", "℃")
+            .replace("◦C", "℃")
+            .replace("°℃", "℃")
+        )
         if translated_text == translate_input:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():
                 llm_translate_tracker.set_placeholder_full_match()
@@ -1026,6 +1060,124 @@ class ILTranslator:
                 composition.pdf_same_style_unicode_characters.pdf_style = (
                     paragraph.pdf_style
                 )
+        # 占位符回填会把源中的 "°"(U+00B0，源中常为 U+25E6 '◦'，已由
+        # paragraph_finder 归一化为 '°') 与模型补的 "℃" 拼成 "°℃"（如
+        # "14 °℃"）。源中 "◦C"/"°C" 常被 styles_and_formulas 误判为公式，
+        # 模型输出 "{vN}℃" 时公式回填 "14 °C" + 模型 "℃" -> "14 °C℃"。
+        # 这里把相邻两段 "…°C"/"…°" + "℃…" 合并为 "…℃…"，消除双度符号。
+        comps = paragraph.pdf_paragraph_composition
+
+        def _comp_unicode(c):
+            if c.pdf_same_style_unicode_characters:
+                return c.pdf_same_style_unicode_characters.unicode
+            if c.pdf_formula:
+                return "".join(
+                    _ch.char_unicode for _ch in (c.pdf_formula.pdf_character or [])
+                )
+            if c.pdf_same_style_characters:
+                return "".join(
+                    _ch.char_unicode for _ch in c.pdf_same_style_characters.pdf_character
+                )
+            return None
+
+        def _comp_set_unicode(c, s):
+            if c.pdf_same_style_unicode_characters:
+                c.pdf_same_style_unicode_characters.unicode = s
+                return True
+            if c.pdf_formula:
+                # 假公式（度符号）降级为纯文本，避免公式渲染保留原字符
+                chars = c.pdf_formula.pdf_character or []
+                for _ch in chars:
+                    _ch.char_unicode = ""
+                c.pdf_formula = None
+                comp2 = PdfParagraphComposition()
+                comp2.pdf_same_style_unicode_characters = PdfSameStyleUnicodeCharacters()
+                comp2.pdf_same_style_unicode_characters.unicode = s
+                comp2.pdf_same_style_unicode_characters.pdf_style = (
+                    paragraph.pdf_style
+                )
+                c.pdf_same_style_unicode_characters = comp2.pdf_same_style_unicode_characters
+                return True
+            return False
+
+        # 兜底清理：模型输出 <sub>{vN}</sub>（把下标数字放进内层占位符）时，
+        # parse_translate_output 会把内层占位符回填删除，留下空标签。
+        # 空标签的左右 <sub>/</sub> 可能落在相邻 composition，需逐段扫描剔除，
+        # 并删除占位符回填后为空的 composition。
+        i = 0
+        while i < len(comps):
+            c = comps[i]
+            u = _comp_unicode(c) or ""
+            # 1) 单个 composition 内含完整空标签（如 "SiO<sub></sub>层"）
+            if u and ("<sub></sub>" in u or "<sup></sup>" in u):
+                if _comp_set_unicode(
+                    c, re.sub(r"<(?:sub|sup)>\s*</(?:sub|sup)>", "", u)
+                ):
+                    continue
+            # 1b) 单个 composition 内的度符号双写（如 "200 ◦℃"、"◦C" 占位符回填拼接）：
+            #     源 "◦"(U+25E6) 常被当公式/占位符，回填后与模型 "℃" 相邻成 "◦℃"，
+            #     或源 "◦C" 与模型 "℃" 拼成 "◦C℃"。仅对纯文本 composition 归一化，
+            #     且只处理源用的 "◦"(U+25E6)，不动标准 "°C"。
+            if u and c.pdf_same_style_unicode_characters and not c.pdf_formula:
+                _nu = u.replace("◦℃", "℃").replace("◦C", "℃")
+                if _nu != u:
+                    c.pdf_same_style_unicode_characters.unicode = _nu
+                    continue
+            # 2) 占位符回填后为空的纯文本/富文本 composition -> 删除
+            if (
+                u == ""
+                and c.pdf_same_style_unicode_characters
+                and not c.pdf_formula
+                and not c.pdf_same_style_characters
+            ):
+                del comps[i]
+                continue
+            # 3) 跨 composition 空标签：左以 <sub>/<sup> 结尾 + 右以 </sub>/</sup> 开头
+            #    （中间空 composition 已被上一步删除）
+            if i + 1 < len(comps):
+                u1 = _comp_unicode(comps[i]) or ""
+                u2 = _comp_unicode(comps[i + 1]) or ""
+                handled = False
+                for tag in ("sub", "sup"):
+                    if u1.endswith(f"<{tag}>") and u2.startswith(f"</{tag}>"):
+                        _comp_set_unicode(comps[i], u1[: -len(f"<{tag}>")])
+                        _comp_set_unicode(comps[i + 1], u2[len(f"</{tag}>") :])
+                        handled = True
+                        break
+                if handled:
+                    i = 0
+                    continue
+            # 4) 度符号合并：u1 以 "°C"/"°" 结尾 + u2 以 "℃" 开头 -> 合并
+            if i + 1 < len(comps):
+                u1 = _comp_unicode(comps[i]) or ""
+                u2 = _comp_unicode(comps[i + 1]) or ""
+                if u1 and u2 and u2.startswith("℃"):
+                    for tail in ("°C", "◦C", "°", "◦"):
+                        if u1.endswith(tail):
+                            merged = u1[: -len(tail)] + u2
+                            if _comp_set_unicode(comps[i], merged):
+                                del comps[i + 1]
+                            break
+            i += 1
+
+        # 最终确定性兜底：跨 composition 的度符号双写（如 "200 ◦℃与℃之间"、
+        # "◦C℃"、"°℃"）若未被上面逐段规则覆盖，则对完整拼接文本做一次归一化
+        # 并重建为纯文本 composition。仅当检测到明确的度符号双写 bug 时触发，
+        # 不影响正常的公式/富文本结构。
+        full = "".join((_comp_unicode(c) or "") for c in comps)
+        if any(k in full for k in ("◦℃", "◦C℃", "°℃", "◦℃与", "◦C与℃")):
+            cleaned = (
+                full.replace("◦℃", "℃")
+                .replace("◦C℃", "℃")
+                .replace("°℃", "℃")
+                .replace("◦C", "℃")
+            )
+            comps.clear()
+            comp = PdfParagraphComposition()
+            comp.pdf_same_style_unicode_characters = PdfSameStyleUnicodeCharacters()
+            comp.pdf_same_style_unicode_characters.unicode = cleaned
+            comp.pdf_same_style_unicode_characters.pdf_style = paragraph.pdf_style
+            comps.append(comp)
         return True
 
     def _build_role_block(self) -> str:
