@@ -762,6 +762,7 @@ def get_character_layout(
                 matching_layouts.append(
                     {
                         "layout": Layout(layout.id, layout.class_name),
+                        "box": layout.box,
                         "priority": (
                             layout_priority.index(layout.class_name)
                             if layout.class_name in layout_priority
@@ -774,27 +775,27 @@ def get_character_layout(
     if not matching_layouts:
         return None
 
-    # Sort by priority (ascending) and IoU value (descending)
-    matching_layouts.sort(key=lambda x: (x["priority"], -x["iou"]))
+    # 优先选择"字符中心点落在框内"的布局，避免高优先级布局（如 table_caption）
+    # 因边缘微小重叠而误吞相邻表格单元格字符（导致表头"描述"列被当作标题处理、
+    # 与 Bits 挤成"Bit描述"、描述列空白）。仅当字符中心真正位于某布局框内时，
+    # 才按优先级（+IoU）决定归属；否则（中心点不落在任何框内，仅边缘相交）
+    # 改按 IoU 选字符大部分所在的框。
+    char_cx = (char_box.x + char_box.x2) / 2
+    char_cy = (char_box.y + char_box.y2) / 2
+    center_inside = [
+        m
+        for m in matching_layouts
+        if m["box"] is not None
+        and m["box"].x <= char_cx <= m["box"].x2
+        and m["box"].y <= char_cy <= m["box"].y2
+    ]
+    if center_inside:
+        # 在包含字符中心的布局中，按优先级（升序）+ IoU（降序）选择
+        center_inside.sort(key=lambda x: (x["priority"], -x["iou"]))
+        return center_inside[0]["layout"]
 
-    # non_hybrid_table_label = None
-    # for layout in matching_layouts:
-    #     layout = layout["layout"]
-    #     label = layout.name
-    #     if is_text_layout(layout) and label not in (
-    #         "table_cell_hybrid",
-    #         "table_text",
-    #         "wireless_table_cell",
-    #         "wired_table_cell",
-    #         "fallback_line",
-    #         "unknown_hybrid",
-    #     ):
-    #         non_hybrid_table_label = layout
-    #         break
-    #
-    # if non_hybrid_table_label:
-    #     return non_hybrid_table_label
-
+    # 字符中心不落在任何布局框内（仅边缘相交）：选 IoU 最大的（字符大部分所在的框）
+    matching_layouts.sort(key=lambda x: -x["iou"])
     return matching_layouts[0]["layout"]
 
 
