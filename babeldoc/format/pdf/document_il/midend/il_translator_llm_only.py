@@ -43,12 +43,16 @@ PROMPT_TEMPLATE = Template(
 ## Structure Rules
 1. Keep **the same number of paragraphs as the input**.
 2. Input paragraphs may be **sliced pieces of the same original paragraph**.  
-   → You MUST treat each input paragraph **as an independent, fixed unit**.  
-   → Do NOT merge paragraphs, split paragraphs, or move content between paragraphs.
+   -> You MUST treat each input paragraph **as an independent, fixed unit**.  
+   -> Do NOT merge paragraphs, split paragraphs, or move content between paragraphs.
+   -> Each output paragraph must contain **only** the translation of its corresponding input. Do NOT repeat or overlap content from other paragraphs.
 3. Inside each paragraph, you may adjust word order for fluency, but:
    - Do NOT change the meaning.
    - Do NOT move placeholders, tags, or code outside their paragraph.
 4. Translate ALL human-readable content into $lang_out.
+   - Section headings (e.g., "1 Introduction", "2.1 Methods", "3 ARCHITECTURE") MUST be translated.
+   - Do NOT treat all-caps words or concatenated words (e.g., "THELIGHTRAG") as code/identifiers.
+   - Only skip translation for: code blocks, API function names (camelCase/snake_case), command-line tools.
 
 ## Do NOT Modify
 - Tags (e.g., <style>, <b>, <code>): keep them exactly the same.  
@@ -582,6 +586,13 @@ class ILTranslatorLLMOnly:
             # 引擎级检测标记，跳过翻译，保持原文 passthrough
             # （弱模型 LLM 常忽略提示词中"参考文献不翻译"的规则）。
             if getattr(paragraph, "skip_translate", False):
+                if pbar:
+                    pbar.advance(1)
+                continue
+
+            # 页眉/页脚（abandon）：保持原文 composition 和行结构，
+            # 避免翻译后重建 composition 丢失原始多行布局
+            if paragraph.layout_label == "abandon":
                 if pbar:
                     pbar.advance(1)
                 continue

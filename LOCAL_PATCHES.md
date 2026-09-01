@@ -274,6 +274,193 @@
     而非问题7的"标签本地化"。修复位置也不同：问题7在 llm_only 后处理，
     问题10在 parse_translate_output 回填 + post_translate 清理管线
 
+## 11. post_translate_paragraph 统一清理管线增强（覆盖 fallback 路径 + Markdown + sub/sup + 公式丢失）
+
+- **症状**: 多文档翻译后出现四类问题：
+  1. `<样式 id='1'></样式>` 标签泄漏（Hopper GPU 论文第9页）--问题7修复在
+     llm_only 路径，但 fallback 到传统路径时无修复
+  2. `**`/`****` Markdown 符号泄漏（electronics-14 第11-12页、jun2017 第4页）--
+     LLM 把 `<style>` 富文本标签误转为 Markdown 粗体
+  3. `<sup>[53]</sup>` 等有内容标签字面量显示（electronics-14 第19页）--
+     问题10只清理空标签，有内容标签未处理
+  4. 图标题中公式丢失（Hopper GPU 第4页 `D = A × B + C`）--LLM 丢弃 `{vN}` 占位符
+- **根因**:
+  1. `<样式>` 修复只在 `il_translator_llm_only.py:764-771`（LLM-only 成功路径），
+     fallback 到 `il_translator.translate_paragraph`（传统路径）时无此修复。
+     `post_translate_paragraph` 是两条路径的公共出口，但之前未在此处修复
+  2. `post_translate_paragraph` 无 Markdown 符号清理；`common_rules.md` 有提示词
+     禁止但弱模型不可靠
+  3. `post_translate_paragraph:1034` 只清理空 `<sub></sub>`/`<sup></sup>`，
+     有内容的 `<sup>[53]</sup>` 保留为字面量。`<sub>`/`<sup>` 不是引擎占位符
+     （引擎用 `<style id='N'>`），是 LLM 凭空生成
+  4. LLM 丢弃 `{vN}` 公式占位符后，`parse_translate_output` 回填时找不到匹配，
+     公式内容丢失，且无检测机制
+- **修复**（`il_translator.py` `post_translate_paragraph`，四处改动）:
+  1. 在清理管线开头加入 `<样式>` -> `<style>` 修复（`re.sub` + `replace`），
+     统一覆盖两条路径
+  2. 加入 Markdown 符号清理：`re.sub(r"\*{2,}", ...)` / `_{2,}` / `~{2,}`，
+     只清理 2+ 连续符号，单个 `*`（乘号）、`_`（变量名）不受影响
+  3. 将空标签清理 `r"<(?:sub|sup)>\s*</(?:sub|sup)>"` 改为全标签清理
+     `r"</?(?:sub|sup)>"`（提取内容，去掉标签壳）
+   4. 在度符号归一化之后、`translated_text == translate_input` 检查之前，
+      检测 `translate_input.placeholders` 中的 `FormulaPlaceholder` 是否在
+      `translated_text` 中丢失（使用与 `parse_translate_output` 相同的 regex
+      模式，允许空格/大小写变体）。丢失时仅记录 `logger.warning`，**不回退**--
+      整段不翻译比丢失个别公式对用户体验更差。
+- **验证**: 待翻译验证
+- **上游价值**: 1-3 属上游普适缺陷（弱模型标签/符号处理不可靠），可考虑提 PR；
+  4 属上游普适缺陷（公式占位符丢失无检测），可考虑提 PR
+
+## 12. table-aware 合并保护增强：IOU 检测
+
+- **症状**: JESD238B.01 表4/表6/表38/表39 表格内容挤压、无序列表乱行
+  （第15/92/129页），单页测试正常但整篇翻译时复现
+- **根因**: `_is_in_table_layout` 用段落中心点是否在 table 版面框内判定。
+  整篇翻译时版面模型的 table 检测精度与单页不同，部分单元格行中心点
+  落在 table 框外（如单元格行偏窄），被漏标为非表格段落，随后被
+  `merge_mid_sentence_continuation_paragraphs` 误并段
+- **修复**（`paragraph_finder.py` `_is_in_table_layout`）:
+  保留原中心点检测，新增 IOU 检测：段落 box 与 table 框重叠面积超过
+  段落面积 50% 也标记为 `in_table_layout=True`
+- **验证**: 待翻译验证
+- **上游价值**: 属上游普适缺陷（表格检测精度不足），可考虑提 PR
+
+## 13. 提示词增强：Note 翻译规则 + 代码/函数名保护
+
+- **症状**:
+  1. JESD238B.01 图42/43/45 的 NOTE 部分乱行，"NOTE" 译法不统一
+  2. NsightSystemsUserGuide 中 API 函数名、命令行工具名被翻译
+- **根因**:
+  1. 提示词无 NOTE 统一译法规则
+  2. 提示词虽有"代码不翻译"规则但不够具体，弱模型将 camelCase/snake_case
+     标识符当普通英文翻译
+- **修复**（`pdf2zh-domain/prompts/base/common_rules.md`）:
+  1. "参考内容处理"部分加入：NOTE/NOTE 1 -> 注/注 1，Note 内容逐行翻译不合并
+  2. "不翻译的内容"部分加入：API 函数名、命令行工具名及参数、代码块内容、
+     配置文件键名、camelCase/snake_case 标识符、文件路径和 URL
+- **验证**: 待翻译验证
+- **上游价值**: 属领域提示词优化，不回提上游
+
+## 14. 图表 NOTE 多条目段落拆分
+
+- **症状**: JESD238B.01 图42/43/45 的 NOTE 部分（NOTE 1~7）格式乱行，
+  所有 NOTE 条目被翻译为一个连续段落，丢失逐行格式
+- **根因**: 版面模型将图表 Note 区域的多行 NOTE 条目归为同一布局块，
+  `_group_characters_into_paragraphs` 将它们合并为一个段落。LLM 翻译
+  整段后，逐行格式丢失。行分段（`_split_paragraph_into_lines`）已正确
+  将每行拆为独立 `PdfLine`，但段落级别未拆分
+- **修复**（`paragraph_finder.py`）:
+  - 新增 `split_note_paragraphs`：在行分段后（第三步）、合并步骤前执行
+  - 检测段落中以 `^NOTE\s+\d+` 开头的行（`PdfLine`），按行拆分为独立段落
+  - 每个 NOTE 条目（含续行）成为独立段落，独立翻译、保留原始行格式
+  - 新增 `_create_split_paragraph` 辅助函数：从原段落的 composition 子集
+    创建新段落，继承 `pdf_style`/`layout_id`/`layout_label`/`xobj_id`
+  - 仅当段落含 2+ 个 NOTE 行时才拆分，避免误拆单 NOTE 段落
+- **验证**: 待翻译验证
+- **上游价值**: 属上游普适缺陷（任何图表 NOTE 多条目场景），可考虑提 PR
+
+## 15. bullet 点字符误判为公式导致无序列表格式乱
+
+- **症状**: JESD238B.01 正文无序列表（第15页第2章特性、第129页 6.9.1
+  HBM3 ECC features 的两级列表）格式乱行——部分列表项的 bullet 点丢失，
+  子 bullet（`\uf09e`）也丢失，导致列表项内容与 bullet 错位
+- **根因**: bullet 字符（`•` U+2022、`\uf09e`/`\uf09f` 等 Wingdings 私有区字符）
+  在 Symbol/Wingdings 特殊字体中，被 `styles_and_formulas.py` 的公式检测
+  （`char.pdf_style.font_id in formula_font_ids`）误判为公式，替换成 `{vN}`
+  占位符送 LLM 翻译。LLM 不一致地保留/丢弃这些占位符（如 `自动裸片错误清理机制`
+  丢失 `•`），导致 bullet 丢失
+- **修复**（两处）:
+  1. `layout_helper.py`：`BULLET_POINT_PATTERN` 追加 `\uf09e\uf09f\uf0a7\uf0b7\uf0d8\uf0e0`
+     等 Wingdings/Symbol 常用 bullet 私有区字符
+  2. `styles_and_formulas.py`：在公式/角标判定之后、空格处理之前，增加
+     `if is_bullet_point(char): is_formula = False`，强制 bullet 字符不作为公式
+- **验证**: 待翻译验证
+- **上游价值**: 属上游普适缺陷（任何用特殊字体的 bullet 列表），可考虑提 PR
+
+## 16. 参考文献标题正则误匹配单数 "Reference"（表格列标题）导致章节标题被跳过
+
+- **症状**: electronics-14-02682-v2 第3页第2章标题 `2. Background and Research
+  Approaches in Hybrid Bonding` 未翻译，保留英文原文
+- **根因**: `_REFERENCE_HEADER_RE` 正则 `^\s*(?:REFERENCES?|BIBLIOGRAPHY)\s*$`
+  中 `REFERENCES?` 的 `S?` 使 S 可选，配合 `re.IGNORECASE` 导致单数
+  `Reference`（表1列标题）也匹配。误触发参考文献模式后，同页以 `数字.`
+  开头的段落（如 `2. Background...`）被 `_REFERENCE_ENTRY_RE` 匹配，
+  标记 `skip_translate=True`
+- **修复**（`paragraph_finder.py`）: `REFERENCES?` 改为 `REFERENCES`（仅复数），
+  保留 `re.IGNORECASE`。`REFERENCES` 匹配 "references"/"References"/"REFERENCES"，
+  不匹配 "reference"/"Reference"
+- **验证**: 待翻译验证
+- **上游价值**: 属上游普适缺陷（表格含 "Reference" 列名的文档），可考虑提 PR
+
+## 17. 章节标题未翻译（LLM 将全大写连写词当标识符）+ 跨页翻译内容重复
+
+- **症状**:
+  1. LightRAG 第3页标题 `3 THELIGHTRAG ARCHITECTURE` 未翻译，LLM 原样返回
+  2. Evolution of GPU 第1-2页跨页段落翻译内容有重复
+- **根因**:
+  1. PDF 提取时 `THE LIGHTRAG` 缺空格变成 `THELIGHTRAG`，LLM 将其当作
+     标识符/代码不翻译（提示词有"代码不翻译"规则）
+  2. 跨页 batch 翻译时，LLM 在两个段落的翻译中包含了重叠内容
+- **修复**:
+  1. `common_rules.md`：加入"章节标题必须翻译"规则，明确即使全大写缩写或
+     连写词也要翻译
+  2. `il_translator_llm_only.py` PROMPT_TEMPLATE：在 Structure Rules 第2条
+     增加 "Each output paragraph must contain only the translation of its
+     corresponding input. Do NOT repeat or overlap content from other paragraphs."
+- **验证**: 待翻译验证
+- **上游价值**: 1 属领域提示词优化；2 属上游普适缺陷（跨页 batch 翻译），
+  可考虑提 PR
+
+## 18. 页眉/页脚（abandon）段落翻译后多行布局丢失
+
+- **症状**: JESD238B.01 页眉原文为两行（"JEDEC Standard No. 238B.01" +
+  "Page 1"），翻译后合并为一行
+- **根因**: `layout_label="abandon"` 的页眉段落被正常翻译，翻译后
+  `post_translate_paragraph` 重建 composition 时丢失原始 `PdfLine` 行结构，
+  排版引擎将所有文字渲染在一行
+- **修复**（`il_translator.py` + `il_translator_llm_only.py`）:
+  两条翻译路径均跳过 `layout_label="abandon"` 段落，保持原文 composition
+  和行结构 passthrough
+- **验证**: 待翻译验证
+- **上游价值**: 属上游普适缺陷（页眉/页脚翻译后布局丢失），可考虑提 PR
+
+## 19. 排版引擎不避让图片，译文覆盖作者照片
+
+- **症状**: Evolution of GPU 第9-10页作者简介文字渲染在作者照片上方，
+  文字压住图片
+- **根因**: 原文段落 box 包含照片区域（原文文字绕排照片），排版引擎在
+  段落 box 内渲染译文时不检测图片位置，直接覆盖。`get_max_right_space`/
+  `get_max_bottom_space` 仅在扩容时检查图片，初始渲染不检查
+- **修复**（`typesetting.py` `render_page`）:
+  在段落位置调整后、渲染前，检测每个段落 box 与 `pdf_form`/`pdf_figure`
+  的重叠。若图片在段落上半部，缩段落 y2 至图片底部；若在下半部，缩段落 y
+  至图片顶部。简化处理（不支持文字绕排），但避免直接覆盖
+- **验证**: 待翻译验证
+- **上游价值**: 属上游普适缺陷（任何文字与图片重叠的布局），可考虑提 PR
+
+## 20. 参考文献检测扩展：支持无编号格式（arXiv 论文）
+
+- **症状**: LightRAG 论文（arXiv 2410.05779v3）第11-12页参考文献被翻译，
+  未保持原文。该论文参考文献条目以作者名开头（如 "Yichuan Li, Kaize Ding,
+  and Kyumin Lee. Grenade:..."），不以 "[N]" 或 "N." 开头，不匹配
+  `_REFERENCE_ENTRY_RE`
+- **根因**: `_mark_reference_paragraphs` 仅标记匹配 `_REFERENCE_ENTRY_RE`
+  （`^\s*(?:\[\d+\]|\d+\.\s)`）的段落。arXiv 论文常用无编号格式（plainnat/
+  apalike 样式），条目以作者名开头，不匹配该正则
+- **修复**（`paragraph_finder.py` `_mark_reference_paragraphs`）:
+  两阶段策略：
+  - 阶段一：用 `_REFERENCE_ENTRY_RE` 匹配 `[N]`/`N.` 格式（IEEE/MDPI/Elsevier），
+    行为与旧代码一致
+  - 阶段二：仅当阶段一无匹配时（arXiv 无编号格式），回退到标记 REFERENCES 标题
+    下方所有段落为 `skip_translate`
+  - 例外：`layout_label=="title"` 的新 section 标题 -> 退出参考文献模式；
+    `layout_label=="abandon"` 的页眉/页脚 -> 跳过
+  - 两阶段策略避免误标记双栏论文中参考文献后的作者简介（如 dally2021：
+    IEEE 格式条目在阶段一匹配，阶段二不触发，右栏作者简介不受影响）
+  跨页续接：未标记任何条目且无标题时退出模式
+- **验证**: 待翻译验证
+- **上游价值**: 属上游普适缺陷（任何无编号参考文献格式），可考虑提 PR
+
 ## 附：相关但未修改的上游问题
 
 - `warmup()` 一次性预下载全部字体，慢网环境拖慢启动--已在
@@ -283,3 +470,206 @@
   传给 BabelDOC config~~ --已根治：在 PDFMathTranslate-next fork 的
   `high_level.py` 补转发该参数（详见该仓库 LOCAL_PATCHES.md 第 2 条，
   双向验证通过）。BabelDOC 本体无需改动
+
+## 21. 参考文献合并后重新标记 skip_translate + 表格内水平重叠段落合并 + 公式占位符追加 + 水印禁用 + 标题翻译加强
+
+- **症状**:
+  1. electronics-14 参考文献34-37页挤在一起被翻译（只有第33页保持原文）
+  2. JESD238B.01 表21/23/26/28 第一行表头单元格挤压（如"Bits"拆成"Bi"+"ts"两个段落，排版后"ts"被压扁）
+  3. Hopper GPU 第4页图2标题公式丢失（LLM 丢弃 {v3}{v4}）
+  4. jun2017 水印出现在文档中间位置
+  5. LightRAG 第3页标题 `3 THELIGHTRAG ARCHITECTURE` 未翻译
+- **根因**:
+  1. `_mark_reference_paragraphs` 在合并步骤前执行，合并后段落结构改变但 skip 标记未更新
+  2. 表格内水平拆分的段落（box x 重叠）被排版引擎压缩 y 范围导致挤压
+  3. 弱模型 LLM 丢弃公式占位符，之前策略仅警告不恢复
+  4. BabelDOC 默认添加水印，水印段落 box 覆盖整页导致排版位置异常
+  5. 弱模型将全大写连写词（THELIGHTRAG）当标识符不翻译
+- **修复**:
+  1. `paragraph_finder.py`：合并步骤后重新调用 `_mark_reference_paragraphs`（重置 `_in_references` 重新检测）
+  2. `paragraph_finder.py`：新增 `merge_overlapping_table_cells`，合并表格内同一行 x 重叠的短段落
+  3. `il_translator.py`：公式占位符丢失时追加到译文末尾（`translated_text += ph.placeholder`）
+  4. `v2_run.py`：默认传 `--watermark-output-mode no_watermark` 禁用水印
+  5. `il_translator_llm_only.py`：PROMPT_TEMPLATE 加入"章节标题必须翻译"+ "不要将全大写连写词当代码"规则
+- **验证**: 待翻译验证
+- **已知未解决**: dally2021 跨页翻译内容重复--弱模型 LLM 在跨页 batch 中重叠内容，提示词约束无效，需引擎级后处理（检测输出重叠度）
+
+## 22. 参考文献跨页标记被 `_in_references = False` 重置破坏（全文翻译复现）
+
+- **症状**: electronics-14 参考文献 33-37 页，全文翻译时只有第 33 页（含
+  References 标题）保持原文，34-37 页（无标题续页）又被合并翻译；拆页
+  翻译单页时正常。用户反馈"拆页好，全文坏"
+- **根因**: 补丁21 的"合并后重新标记"方案在 `process_page` 每次处理页面时
+  执行 `self._in_references = False`，然后重新调用 `_mark_reference_paragraphs`。
+  该重置破坏了 `_in_references` 的跨页延续状态——34-37 页无 References 标题，
+  重置后 `_in_references=False`，`_mark_reference_paragraphs` 直接 return，
+  不标记任何段落。同时合并步骤会把参考文献条目合并成超长段落，
+  导致阶段一正则只能匹配合并后段落的第一个 `N.`
+- **修复**（`paragraph_finder.py`）:
+  1. 删除"合并后重新标记"块（含 `self._in_references = False` 重置），
+     恢复 `_in_references` 跨页延续
+  2. 三个合并函数（`merge_alternating_line_number_paragraphs` /
+     `merge_title_caption_and_table_fragments` /
+     `merge_mid_sentence_continuation_paragraphs`）均跳过
+     `skip_translate=True` 的段落——参考文献条目不参与合并，保持独立、
+     skip 标记保留，无需合并后重新标记
+- **验证**: 待翻译验证（全文翻译 electronics-14 参考文献页）
+- **上游价值**: 属上游普适缺陷（参考文献跨页标记），可考虑提 PR
+
+## 23. 参考文献无编号格式 + 表格行几何兜底 + URL 拆字修复
+
+- **症状**（Qwen 模型全文翻译复现）:
+  1. electronics-14 第1页版权声明 URL 被 LLM 拆成逐字符（"h\nt\nt\nt\np\ns\n://"）
+  2. 部分文档参考文献无编号开头（既非 [N]/N. 也非 arXiv 作者名），漏标
+  3. JESD238B.01 表4/6/10 第一行数值单元格（2Gb/4Gb/6Gb/8Gb）挤到同一格
+     ——拆页翻译正常、全文翻译复现
+- **根因**:
+  1. LLM 输出时把长 URL 逐字符换行拆开
+  2. 参考文献标记两阶段策略（阶段二仅在"阶段一无匹配"触发），混合格式
+     （同一章节既有编号又有无编号条目）时无编号条目漏标
+  3. `in_table_layout` 依赖版面模型 table 框，全文翻译时版面模型对某些页
+     table 检测不准确，导致漏标、表格单元格被误合并
+- **修复**:
+  1. `il_translator.py` `post_translate_paragraph`：新增 URL 修复正则，
+     合并被拆成逐字符的 http/https 前缀
+  2. `paragraph_finder.py` `_mark_reference_paragraphs`：重构为直接标记
+     标题下方所有段落（不再依赖 `_REFERENCE_ENTRY_RE` 分阶段），覆盖
+     [N]/N./无编号/混合格式；排除 title（新章节）、abandon（页眉/页脚）、
+     作者简介（连续大写字母开头如 "WILLIAM J. DALLY is..."）
+  3. `paragraph_finder.py`：新增 `_mark_table_row_paragraphs` 几何兜底——
+     同一行 >= 3 个短段落（< 30 字符）识别为表格行，补充 in_table_layout
+     标记（不依赖版面模型 table 框）
+- **验证**: 待翻译验证
+- **上游价值**: 属上游普适缺陷（无编号参考文献、表格漏标、URL 拆字），可提 PR
+
+## 24. 参考文献标题上方的 section 标题误触发"退出参考文献模式"，破坏跨页延续
+
+- **症状**: electronics-14 参考文献 34-37 页被合并翻译（只有第 33 页含
+  References 标题的保持原文）；拆页单页翻译正常，全文/跨页翻译复现。用户
+  反馈"第 33 页正常，34-37 页合并翻译"。
+- **根因**: `_mark_reference_paragraphs` 的标记循环中，"遇到新的 section
+  标题（`layout_label=="title"`）退出参考文献模式"的检查位于
+  `_below_header` 判断**之前**。参考文献章节**上方**的正文小节标题
+  （如 electronics-14 第 33 页的 "Structural Design."、"Integrated
+  Perspective."）也满足 `layout_label=="title"`，被误判为"References
+  之后的新章节"，将 `self._in_references` 复位为 `False`。由于该页恰是
+  含 References 标题的页，复位后第 34-37 页（无标题续页）进入时
+  `_in_references=False`，直接 return，不标记任何段落，参考文献被当正文
+  合并翻译。
+- **修复**（`paragraph_finder.py` `_mark_reference_paragraphs`）:
+  将 `if not _below_header(para): continue` 提前到 `layout_label=="title"`
+  检查**之前**。这样：
+  - 参考文献标题**上方**的段落（含 section 标题）先被 `_below_header`
+    排除，不触发"退出参考文献模式"；
+  - 仅当标题位于 References 标题**下方**（视觉下方，y<=header_y，即真正
+    的"参考文献之后的新章节"）时才退出模式；
+  - 跨页续接页（`found_header=False` 时 `_below_header` 恒 True）行为不变，
+    新的 section 标题仍能正常退出参考文献模式。
+- **验证**: electronics-14 `--split --pages 33-37` 重译，dbg 确认
+  `_in_references` 在 33-37 全部保持 True，34-37 页参考文献均保持原文
+  （不翻译、不合并）。第 33 页 `exited` 由 True 变为 False。
+- **上游价值**: 属上游普适缺陷（任何"参考文献标题上方含 section 标题"的
+  双栏/单栏论文），可提 PR
+
+## 25. LINE_BREAK_REGEX 未转义连字符构成字符范围，误吞 . / : 等标点，导致 URL 逐字符折行
+
+- **症状**: electronics-14 第 1 页版权声明长 URL（如
+  `https://creativecommons.org/licenses/by/4.0/`）在窄栏中被**逐字符拆到
+  单独一行**（渲染为 "h/t/t/p/s/:///creativecommons..."），排版极乱。
+  补丁 23 的 URL 修复正则无效（LLM 输出的 URL 本就连贯无换行，问题出在
+  排版阶段而非翻译阶段）。
+- **根因**: `typesetting.py` 的 `LINE_BREAK_REGEX`（用于判断"不可断行"的
+  单词字符）中，字面连字符写成未转义的 `r"-"`，且位于 `r"'"` 与
+  `r"·"`（U+00B7）之间。在正则字符类中，未转义的 `-` 与前后字符构成范围
+  `'-·`（U+0027 至 U+00B7），把 `.`（U+002E）、`/`（U+002F）、`:`
+  （U+003A）及 `@` 等标点一并纳入"不可断行"集合。长 URL 整串被视为一个
+  不可断行的单词，`_get_width_before_next_break_point` 返回整串宽度，超过
+  窄栏宽度后每个字符都被迫换行到单独一行。
+- **修复**（`typesetting.py`）: `r"-"` 改为 `r"\-"`（转义连字符）。这样
+  `-` 仍为不可断行（语义不变），但不再与 `·` 构成范围，`.` `/` `:` `@`
+  恢复为可断行标点，URL 可在 `/` 与 `.` 处自然折行。
+- **验证**: electronics-14 `--split --pages 1` 重译，版权 URL 由逐字符拆分
+  变为按 `/`/`.` 断行（`https://creativecommons.org/licenses/by/4.0/`
+  在 `/` 后换行）。
+- **上游价值**: 属上游普适缺陷（字符类中未转义 `-` 构成意外范围，影响
+  URL/文件路径等长无空格串的断行），可提 PR
+
+## 26. `--debug` 模式下 write_json 用 orjson 一次性序列化整篇 IL 触发 MemoryError
+
+- **症状**: 对密集大文档（JESD238B.01）执行 `--debug` 时，在
+  `_do_translate_single` 的 `xml_converter.write_json(...)` 处抛
+  `MemoryError` 直接中断整个翻译。命令行：
+  `run.cmd --v2 JESD238B.01.pdf -p 1-50 --split --debug -o ...`
+- **根因**: `xml_converter.py` 的 `write_json` 用
+  `orjson.dumps(document, option=OPT_INDENT_2, ...).decode()` **一次性在内存
+  中构建完整 JSON 字符串**再写入文件。IL 对象树解析阶段已占用 ~1.5GB 内存，
+  `OPT_INDENT_2` 又把 JSON 体积膨胀数倍（50 页密集规范的单份 debug JSON 达
+  120-170MB，整串字符串再加缩进可超 500MB）。在既有对象树之上再分配整串
+  JSON 字符串即超内存上限 → MemoryError。该 `write_json` 在 debug 管线中被
+  调用 ~8 次（create_il/detect_scanned/layout/paragraph_finder/styles/
+  il_translated/add_debug/typsetting），任一处崩溃都会中断翻译。
+- **修复**（`xml_converter.py`）:
+  - 新增 `_json_default`：用 `dataclasses.is_dataclass` + `dataclasses.fields`
+    展开 IL 的 `@dataclass(slots=True)` 对象（slots 无 `__dict__`，不能用
+    `__dict__`），并处理 `LazyPassthroughInstruction.materialize()`。
+  - `write_json` 改用标准库 `json.dump(...)` **流式写入文件**——`iterencode`
+    逐块产出 JSON，不再在内存中构建整串。内存占用仅与对象树本身相当，不再
+    叠加整串 JSON。
+  - 序列化异常时 `except Exception` 记录 `logger.warning` 并跳过该次 debug
+    转储，**不再中断翻译**（debug 转储仅为诊断用，失败不应中止主流程）。
+  - `to_json` 同步改为 `json.dumps` + `_json_default`；移除不再使用的
+    `orjson` 依赖。
+- **验证**: JESD238B.01 `-p 1-50 --split --debug` 不再报 MemoryError，debug
+  管线各阶段 JSON 全部成功写出（create_il=122MB、paragraph_finder=169MB、
+  styles_and_formulas=171MB 等）。代价是流式 `json.dump` 比 orjson 慢
+  （每 120MB 约 1min），debug 模式本就近重，可接受。
+- **上游价值**: 属上游普适缺陷（`--debug` 对密集大文档内存溢出），可提 PR
+
+## 27. `--debug` 模式下 .decompressed.pdf 解压版产物污染输出目录
+
+- **症状**: 使用 `--debug`（尤其配合 `--split`）翻译后，输出目录除了正常产物
+  （`.zh.mono.pdf`/`.zh.dual.pdf`/`.zh.glossary.csv`）外，还残留两个
+  `*.decompressed.pdf`（mono/dual 各一）解压诊断文件；配合 `--split` 时还带
+  `_split_` 前缀，且 `rename_split_outputs` 会跳过 `.decompressed` 不重命名，
+  导致输出目录多出 `_split_xxx.decompressed.pdf`。
+- **根因**: `pdf_creater.py` 在 debug 模式下把解压版 PDF 直接存到
+  `f"{mono_out_path}.decompressed.pdf"` / `f"{dual_out_path}.decompressed.pdf"`
+  （即输出目录），与正式产物混在一起。这些是诊断中间文件，不应进输出目录。
+- **修复**（`pdf_creater.py`）: 把两处 debug 解压产物改写到
+  `translation_config.get_working_file_path(f"{basename}.mono/dual.decompressed.pdf")`
+  （工作目录，与 `*.debug.json` 同类），不再进入输出目录。
+- **验证**: LightRAG `-p 9 --split --debug` 后输出目录仅含 3 个正式产物 + 正常
+  `_bak` 备份，`.decompressed.pdf` 出现在工作目录。
+- **上游价值**: 属上游行为偏好（诊断文件进输出目录），可考虑提 PR 或保留本地。
+
+## 28. 正文段落与表格重叠：排版时正文不绕开表格区域
+
+- **症状**: LightRAG 第 9 页第 4.5 节，正文段落（"我们从两个关键角度…"）的译文
+  渲染在右侧表格（Figure 2）上方，两者重叠，正文覆盖表格内容。源文档该节为
+  "左栏正文 + 右栏表格 + 表格下方通栏续接"的混合布局，正文段落框被版面模型判为
+  通栏（x=108-505），导致译文跨到右侧栏盖住表格。
+- **根因**: `_layout_typesetting_units` 排版正文时，右缘固定为 `box.x2`，不感知
+  表格区域。当正文段落框横跨表格所在栏（版面模型把"左栏正文 + 表格下方通栏续接"
+  并为一个通栏段落框）时，译文逐行流到表格上方。`get_max_bottom_space`/
+  `get_max_right_space` 只检查 pdf_form/pdf_figure/pdf_curve，不检查表格
+  （`in_table_layout` 单元格），且此场景段落并不扩容（框已通栏），故扩容阻挡也
+  不生效。
+- **修复**（`typesetting.py`）:
+  - `_layout_typesetting_units` 新增可选参数 `table_barriers`（`in_table_layout`
+    段落的框列表）。排版每个单元前，若当前行 y 区间与某个表格单元格重叠，则把
+    该行右缘 `line_right` 收窄到最左的表格单元格左缘；换行判定改用 `line_right`。
+    效果：正文行在与表格重叠的 y 区间内绕排到表格左侧，表格上方/下方保持通栏。
+  - `_find_optimal_scale_and_layout` 新增 `table_barriers` 参数，从
+    `page.pdf_paragraph` 收集 `in_table_layout` 单元格框（非表格段落才收集），
+    并透传给 `_layout_typesetting_units`（含去英文换行限制的递归调用）。
+  - **表格标题（caption）补入障碍**：布局模型常把表格标题判为 `plain text`
+    （而非 `in_table_layout`），正文首行若与其同 y 带且通栏会覆盖标题。故收集
+    in_table 单元格后，额外把"与任一 in_table 单元格在 x 上重叠 > 50%、且在 y
+    上紧邻（< 6pt）"的段落视为该表格标题，一并纳入 `table_barriers`，使正文
+    首行也绕开标题所在列（LightRAG 第9页正文首行覆盖"图：法律数据集…"标题）。
+  - 表格自身段落（`in_table_layout=True`）不参与自身绕排，避免影响表格内布局。
+- **验证**: LightRAG `-p 9 --split` 重译，正文在表格及表格标题 y 区间（537-624）
+  均绕到左栏（x=107-326），表格标题（x=325-496）与正文首行（x=107-323）不再重叠，
+  表格上方/下方通栏。回归 `--layer1` 15 通过；electronics-14 参考文献 33-37 页仍
+  保持英文原文。
+- **上游价值**: 属上游普适缺陷（任何"正文跨表格栏"场景），可考虑提 PR。

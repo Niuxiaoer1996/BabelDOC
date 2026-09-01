@@ -293,6 +293,11 @@ class ParagraphFinder:
             self.process_paragraph_spacing(paragraph)
             self.update_paragraph_data(paragraph)
 
+        # 第三步半：拆分包含多个 "NOTE N" 条目的段落
+        # 图表 Note 部分的多个 NOTE 条目常被版面模型归为同一布局块，
+        # 合并为一个段落。LLM 翻译整段后逐行格式丢失。按 "NOTE N" 行拆分。
+        self.split_note_paragraphs(paragraphs)
+
         # 第四步：计算所有行宽度的中位数
         median_width = self.calculate_median_line_width(paragraphs)
 
@@ -323,6 +328,8 @@ class ParagraphFinder:
             paragraph.in_table_layout = self._is_in_table_layout(
                 paragraph, table_boxes
             )
+        # 几何特征兜底：版面模型 table 框漏标时，用"同行多短段落"特征补充标记
+        self._mark_table_row_paragraphs(paragraphs)
 
         # 参考文献（References/Bibliography）章节检测：
         # 检测到 "REFERENCES" 标题段后，其下方以 "[N]" 开头的段落标记为
@@ -343,6 +350,11 @@ class ParagraphFinder:
             and getattr(self.translation_config, "merge_mid_sentence_paragraphs", True)
         ):
             self.merge_title_caption_and_table_fragments(paragraphs)
+
+        # 新增后处理：合并表格内同一行水平重叠的段落（如 "Bi"+"ts" 被拆成两个段落）
+        # 这类段落 box 在 x 方向重叠（gap < 0），排版引擎检测到重叠后会压缩 y 范围导致挤压
+        if not toc_page:
+            self.merge_overlapping_table_cells(paragraphs)
 
         # 新增后处理：合并被版面模型误切分的句中续接段落（如图片旁正文被切成多块）
         if (
@@ -463,8 +475,9 @@ class ParagraphFinder:
         i = 0
         while i < len(paragraphs) - 2:
             a = paragraphs[i]
-            # 表格区段落不参与行号交替合并（表格单元格行应保持独立）
-            if getattr(a, "in_table_layout", False):
+            # 表格区段落不参与行号交替合并（表格单元格行应保持独立）；
+            # 参考文献条目（skip_translate）也不参与合并
+            if getattr(a, "in_table_layout", False) or getattr(a, "skip_translate", False):
                 i += 1
                 continue
             # 吞掉一个或多个连续的行号段 l
@@ -478,8 +491,10 @@ class ParagraphFinder:
             # 现在 j 指向候选的 c
             if saw_l and j < len(paragraphs):
                 c = paragraphs[j]
-                if not getattr(c, "in_table_layout", False) and self._same_layout_and_xobj(
-                    a, c
+                if (
+                    not getattr(c, "in_table_layout", False)
+                    and not getattr(c, "skip_translate", False)
+                    and self._same_layout_and_xobj(a, c)
                 ):
                     a.pdf_paragraph_composition.extend(c.pdf_paragraph_composition)
                     self.update_paragraph_data(a)
@@ -531,6 +546,94 @@ class ParagraphFinder:
                 return c.pdf_line.box.y2 - c.pdf_line.box.y
         return None
 
+    _NOTE_START_RE = re.compile(r"^NOTE\s+\d+", re.IGNORECASE)
+
+    def split_note_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """拆分包含多个 "NOTE N" 条目的段落。
+
+        图表 Note 部分的多个 NOTE 条目常被版面模型归为同一布局块，
+        合并为一个段落。LLM 翻译整段后逐行格式丢失。
+        本函数检测段落中以 "NOTE N" 开头的行，按行拆分为独立段落，
+        使每个 NOTE 条目独立翻译、保留原始行格式。
+        """
+        new_paragraphs = []
+        for paragraph in paragraphs:
+            comps = paragraph.pdf_paragraph_composition
+            if not comps or len(comps) < 2:
+                new_paragraphs.append(paragraph)
+                continue
+
+            # 获取每行的文本（仅 pdf_line 类型）
+            line_texts = []
+            for comp in comps:
+                if comp.pdf_line:
+                    text = get_char_unicode_string(
+                        comp.pdf_line.pdf_character
+                    ).strip()
+                    line_texts.append(text)
+                else:
+                    line_texts.append(None)
+
+            # 找到所有 "NOTE N" 开头的行索引
+            note_indices = [
+                i
+                for i, t in enumerate(line_texts)
+                if t and self._NOTE_START_RE.match(t)
+            ]
+
+            # NOTE 行不超过 1 个，不需要拆分
+            if len(note_indices) <= 1:
+                new_paragraphs.append(paragraph)
+                continue
+
+            logger.info(
+                f"Splitting NOTE paragraph {paragraph.debug_id} into "
+                f"{len(note_indices)} paragraphs"
+            )
+
+            # NOTE 之前的行（如果有）作为独立段落
+            first_note_idx = note_indices[0]
+            if first_note_idx > 0:
+                pre_para = self._create_split_paragraph(
+                    paragraph, comps[:first_note_idx]
+                )
+                if pre_para:
+                    new_paragraphs.append(pre_para)
+
+            # 按 NOTE 行拆分，每组从 NOTE 行到下一个 NOTE 行之前
+            for gi, start_idx in enumerate(note_indices):
+                end_idx = (
+                    note_indices[gi + 1]
+                    if gi + 1 < len(note_indices)
+                    else len(comps)
+                )
+                group_comps = comps[start_idx:end_idx]
+                note_para = self._create_split_paragraph(
+                    paragraph, group_comps
+                )
+                if note_para:
+                    new_paragraphs.append(note_para)
+
+        paragraphs.clear()
+        paragraphs.extend(new_paragraphs)
+
+    def _create_split_paragraph(
+        self, original: PdfParagraph, comps: list
+    ) -> PdfParagraph | None:
+        """从原段落的 composition 子集创建新段落。"""
+        if not comps:
+            return None
+        new_para = PdfParagraph(
+            pdf_paragraph_composition=list(comps),
+            layout_id=original.layout_id,
+            debug_id=generate_base58_id(),
+            layout_label=original.layout_label,
+        )
+        new_para.pdf_style = original.pdf_style
+        new_para.xobj_id = original.xobj_id
+        self.update_paragraph_data(new_para, update_unicode=True)
+        return new_para
+
     def _is_in_table_layout(
         self, paragraph: PdfParagraph, table_boxes: list[Box]
     ) -> bool:
@@ -538,33 +641,89 @@ class ParagraphFinder:
 
         以段落 box 中心点是否被某个 "table" 版面框包含为准。表格区单元格行
         （fallback_line）会被归为 True，从而跳过"句中续接"合并，保持每行独立。
+
+        增强：除中心点外，还检查段落 box 与 table 框的重叠面积比（IOU > 50%），
+        解决中心点偏移导致的漏标（如单元格行偏窄、中心点落在框外）。
         """
         if not table_boxes or paragraph.box is None:
             return False
         cx = (paragraph.box.x + paragraph.box.x2) / 2
         cy = (paragraph.box.y + paragraph.box.y2) / 2
         for box in table_boxes:
+            # 原逻辑：中心点在 table 框内
             if box.x <= cx <= box.x2 and box.y <= cy <= box.y2:
+                return True
+            # 增强：段落 box 与 table 框重叠面积超过段落面积 50%
+            x_overlap = max(
+                0, min(paragraph.box.x2, box.x2) - max(paragraph.box.x, box.x)
+            )
+            y_overlap = max(
+                0, min(paragraph.box.y2, box.y2) - max(paragraph.box.y, box.y)
+            )
+            overlap_area = x_overlap * y_overlap
+            para_area = (paragraph.box.x2 - paragraph.box.x) * (
+                paragraph.box.y2 - paragraph.box.y
+            )
+            if para_area > 0 and overlap_area / para_area > 0.5:
                 return True
         return False
 
+    def _mark_table_row_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """几何特征兜底：检测表格行段落，补充 in_table_layout 标记。
+
+        版面模型（DocLayout）在全文翻译时对某些页的 table 框检测可能不准确，
+        导致 in_table_layout 漏标、表格单元格被误合并。这里用几何特征兜底：
+        同一行（y 中心差 < 3pt）有 >= 2 个其他短段落（< 30 字符）且 x 不重叠，
+        识别为表格行。数值单元格（如 "2 Gb"、"4 Gb"）满足此特征。
+        """
+        # 已知 layout_label 名，用于排除幽灵段落
+        _ghost = {"fallback_line", "plain text", "title", "abandon",
+                  "table_caption", "figure_caption", "table", "figure"}
+        short_paras = []
+        for p in paragraphs:
+            if p.box is None:
+                continue
+            text = (self._para_text(p) or "").strip()
+            if text and len(text) < 30 and text.lower() not in _ghost:
+                short_paras.append(p)
+
+        for para in short_paras:
+            if getattr(para, "in_table_layout", False):
+                continue
+            cy = (para.box.y + para.box.y2) / 2
+            same_row = []
+            for p in short_paras:
+                if p is para:
+                    continue
+                pcy = (p.box.y + p.box.y2) / 2
+                if abs(cy - pcy) < 3.0:
+                    same_row.append(p)
+            # 同一行有 >= 2 个其他短段落 -> 表格行
+            if len(same_row) >= 2:
+                para.in_table_layout = True
+
     # 参考文献标题（大小写不敏感，允许行尾空白）
+    # 仅匹配复数形式 REFERENCES/References，不匹配单数 Reference
+    # （避免表格列标题 "Reference" 被误判为参考文献章节标题）
     _REFERENCE_HEADER_RE = re.compile(
-        r"^\s*(?:REFERENCES?|BIBLIOGRAPHY)\s*$", re.IGNORECASE
+        r"^\s*(?:REFERENCES|BIBLIOGRAPHY)\s*$", re.IGNORECASE
     )
-    # 参考文献条目：段落首字符为 "[N]" 或 "N."（两种常见格式）
+    # 参考文献条目格式参考（仅文档说明，标记逻辑已改为"标题下方所有段落"）:
     #   - IEEE 风格: "[1] JEDEC Standard High Bandwidth Memory..."
     #   - MDPI/Elsevier 风格: "1. Jun, H.; Cho, J.; Lee, K.; ..."
-    _REFERENCE_ENTRY_RE = re.compile(r"^\s*(?:\[\d+\]|\d+\.\s)")
+    #   - arXiv 无编号: "Yichuan Li, Kaize Ding, and Kyumin Lee. Grenade:..."
 
     def _mark_reference_paragraphs(self, paragraphs: list[PdfParagraph]):
         """标记 References/Bibliography 章节条目为 skip_translate。
 
-        - 本页检测到 "REFERENCES"/"References"/"BIBLIOGRAPHY" 标题段 -> 进入参考文献
-          模式，其下（IL y 更小，即视觉下方）以 "[N]" 或 "N." 开头的段落标记
-          skip_translate
-        - 跨页：上一页处于参考文献模式时，本页顶部以 "[N]"/"N." 开头的段落继续标记
-        - 标题本身不标记（正常翻译为"参考文献"）
+        直接标记 REFERENCES 标题下方所有段落（不再依赖正则分阶段），
+        覆盖 [N]（IEEE）/ N.（MDPI/Elsevier）/ 无编号（arXiv 作者名）及混合格式。
+        覆盖 [N]/N./无编号/混合格式。排除 title（新章节）、abandon（页眉/页脚）、
+        作者简介（连续大写字母开头，如 "WILLIAM J. DALLY is..."）。
+
+        - 遇到新的 section 标题（layout_label=="title"）时退出参考文献模式
+        - 跨页：上一页处于参考文献模式时，本页段落继续标记
+        - 页眉/页脚（layout_label=="abandon"）和 REFERENCES 标题本身不标记
         - 注意：调用时机在 update_paragraph_data(update_unicode=True) 之前，
           段落的 unicode 属性尚未填充，需从 composition 自行拼接文本。
         """
@@ -579,13 +738,9 @@ class ParagraphFinder:
         if found_header:
             self._in_references = True
         elif not self._in_references:
-            # 不在参考文献模式，本页无标题 -> 无操作
             return
 
-        # 2) 标记以 "[N]"/"N." 开头的段落
-        #    IL 坐标 y 向上为正（大=视觉上方）。REFERENCES 标题上方是正文，
-        #    标题下方（y 更小）才是参考文献条目。跨页模式（标题在上页）时
-        #    标记整页的 "[N]"/"N." 段落。
+        # 2) 计算 header_y（标题的 y 坐标，用于区分上下方）
         header_y = None
         if found_header:
             for para in paragraphs:
@@ -594,23 +749,56 @@ class ParagraphFinder:
                     header_y = para.box.y
                     break
 
+        # 辅助：判断段落是否在标题下方（或跨页续接时整页均可）
+        def _below_header(para):
+            if not found_header or header_y is None or para.box is None:
+                return True  # 跨页续接：整页都在参考文献区
+            return para.box.y <= header_y
+
+        # 辅助：判断是否为应跳过的非条目段落
+        def _is_non_entry(para, text):
+            if not text:
+                return True
+            if self._REFERENCE_HEADER_RE.match(text):
+                return True  # 标题本身
+            if para.layout_label == "abandon":
+                return True  # 页眉/页脚
+            return False
+
+        # 标记标题下方所有段落为 skip_translate。
+        # 不再依赖 _REFERENCE_ENTRY_RE 正则：直接标记标题下方所有段落，
+        # 覆盖 [N]（IEEE）、N.（MDPI/Elsevier）、无编号（arXiv 作者名）及混合格式。
+        # 排除：title（新 section 标题，退出模式）、abandon（页眉/页脚）、
+        # 作者简介（连续大写字母开头，如 "WILLIAM J. DALLY is..."，避免双栏
+        # 论文中参考文献后紧跟的作者简介被误标记）。
+        marked_any = False
+        exited = False
         for para in paragraphs:
             text = self._para_text(para).strip()
-            if not text or not self._REFERENCE_ENTRY_RE.match(text):
+            if _is_non_entry(para, text):
                 continue
-            if found_header and header_y is not None and para.box is not None:
-                # IL 坐标：y 向上为正（大=视觉上方）。REFERENCES 标题上方是正文，
-                # 标题下方才是参考文献条目。仅标记标题下方（y <= header_y）的条目。
-                if para.box.y > header_y:
-                    continue
+            # 先判断是否在标题下方（视觉下方 y<=header_y）。标题上方的段落
+            # （如参考文献章节前的正文小节标题 "Structural Design"）不属于
+            # 参考文献区，不应触发"遇到新 section 标题退出"的逻辑，否则会把
+            # _in_references 复位，破坏跨页延续（见补丁 24）。
+            if not _below_header(para):
+                continue
+            # 遇到新的 section 标题（位于 References 标题下方）-> 退出参考文献模式
+            if para.layout_label == "title":
+                self._in_references = False
+                exited = True
+                continue
+            if getattr(para, "skip_translate", False):
+                marked_any = True
+                continue
+            # 跳过作者简介：连续大写字母开头（如 "WILLIAM J. DALLY is..."）
+            if re.match(r"^[A-Z]{3,}\s", text):
+                continue
             para.skip_translate = True
+            marked_any = True
 
-        # 3) 跨页续接判断：若本页有以 "[N]"/"N." 开头的段落（说明仍在参考文献），保持模式
-        has_entry = any(
-            self._REFERENCE_ENTRY_RE.match(self._para_text(p).strip())
-            for p in paragraphs
-        )
-        if not has_entry and not found_header:
+        # 3) 跨页续接判断：若本页未标记任何条目且无标题，退出参考文献模式
+        if not found_header and not marked_any and not exited:
             self._in_references = False
 
     @staticmethod
@@ -651,7 +839,11 @@ class ParagraphFinder:
         i = 0
         while i < len(paragraphs):
             a = paragraphs[i]
-            if a.box is None or getattr(a, "in_table_layout", False):
+            if (
+                a.box is None
+                or getattr(a, "in_table_layout", False)
+                or getattr(a, "skip_translate", False)
+            ):
                 i += 1
                 continue
             last_ch = self._paragraph_last_char(a)
@@ -670,6 +862,7 @@ class ParagraphFinder:
                 if (
                     b.box is None
                     or getattr(b, "in_table_layout", False)
+                    or getattr(b, "skip_translate", False)
                     or a.xobj_id != b.xobj_id
                     or b.first_line_indent
                     or getattr(b, "toc_role", None) == "layout"
@@ -710,6 +903,72 @@ class ParagraphFinder:
                 continue  # 尝试继续把更右的片段并入
             i += 1
 
+    def merge_overlapping_table_cells(self, paragraphs: list[PdfParagraph]):
+        """合并表格内同一行水平重叠的段落。
+
+        版面模型有时把表格表头的一个单元格拆成多个水平重叠的段落
+        （如 "Bits" 拆成 "Bi" + "ts"，box 在 x 方向重叠）。
+        排版引擎检测到 x 重叠后会压缩 y 范围，导致内容挤压不可读。
+        本函数检测同属 table 布局框、同一行、x 重叠的短段落并合并。
+        严格条件：y 中心差 <= 2pt（同一行），x 实际重叠（gap <= 0），
+        排除幽灵段落（unicode 等于 layout_label 名）。
+        """
+        if not paragraphs or len(paragraphs) < 2:
+            return
+        # 已知的 layout_label 名，用于排除幽灵段落
+        _ghost_texts = {"fallback_line", "plain text", "title", "abandon",
+                        "table_caption", "figure_caption", "table", "figure"}
+        i = 0
+        while i < len(paragraphs):
+            a = paragraphs[i]
+            if a.box is None or not getattr(a, "in_table_layout", False):
+                i += 1
+                continue
+            a_text = (a.unicode or "").strip()
+            if not a_text or a_text.lower() in _ghost_texts:
+                i += 1
+                continue
+            a_cy = (a.box.y + a.box.y2) / 2
+            best_j = None
+            best_gap = float("inf")
+            for j in range(len(paragraphs)):
+                if j == i:
+                    continue
+                b = paragraphs[j]
+                if (
+                    b.box is None
+                    or not getattr(b, "in_table_layout", False)
+                    or a.xobj_id != b.xobj_id
+                ):
+                    continue
+                b_text = (b.unicode or "").strip()
+                if not b_text or b_text.lower() in _ghost_texts:
+                    continue
+                b_cy = (b.box.y + b.box.y2) / 2
+                if abs(a_cy - b_cy) > 2.0:  # 同一行（严格阈值）
+                    continue
+                # x 实际重叠（gap <= 0），不是仅仅靠近
+                h_gap = b.box.x - a.box.x2
+                if h_gap > 0:
+                    continue
+                # 只合并短段落（表头单元格碎片，非正文）
+                if len(a_text) > 30 or len(b_text) > 30:
+                    continue
+                if abs(h_gap) < best_gap:
+                    best_j = j
+                    best_gap = abs(h_gap)
+            if best_j is not None:
+                b = paragraphs[best_j]
+                a.pdf_paragraph_composition.extend(b.pdf_paragraph_composition)
+                self.update_paragraph_data(a)
+                del paragraphs[best_j]
+                logger.info(
+                    "Merged overlapping table cell"
+                    f" {b.debug_id} into {a.debug_id}."
+                )
+                continue
+            i += 1
+
     def merge_mid_sentence_continuation_paragraphs(self, paragraphs: list[PdfParagraph]):
         """合并被版面模型误切分的“句中续接”段落。
 
@@ -733,7 +992,8 @@ class ParagraphFinder:
             a = paragraphs[i]
             # 表格区段落不参与"句中续接"合并：表格单元格行本应每行独立，
             # 若被误并成一段，译文流式重排会挤压到表格顶部，丢失行对齐。
-            if getattr(a, "in_table_layout", False):
+            # 参考文献条目（skip_translate）也不参与合并。
+            if getattr(a, "in_table_layout", False) or getattr(a, "skip_translate", False):
                 i += 1
                 continue
             merged = False
@@ -758,6 +1018,7 @@ class ParagraphFinder:
                         if (
                             b.box is None
                             or getattr(b, "in_table_layout", False)
+                            or getattr(b, "skip_translate", False)
                             or a.xobj_id != b.xobj_id
                             or (a.layout_label or "") != (b.layout_label or "")
                             or b.first_line_indent

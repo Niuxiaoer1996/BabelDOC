@@ -595,6 +595,11 @@ class ILTranslator:
         if getattr(paragraph, "skip_translate", False):
             return None
 
+        # Skip abandon paragraphs (page headers/footers): 保持原文 composition 和行结构，
+        # 避免翻译后重建 composition 丢失原始多行布局（如页眉 "JEDEC Standard..." + "Page 1" 合并为一行）
+        if paragraph.layout_label == "abandon":
+            return None
+
         # Skip paragraphs with only placeholders
         if is_placeholder_only_paragraph(paragraph):
             return None
@@ -1028,11 +1033,28 @@ class ILTranslator:
     ):
         """Post-translation processing: update paragraph with translated text."""
         tracker.set_output(translated_text)
-        # 清理 LLM 输出的空上/下标标签（如 SiO<sub></sub>），避免原文直出
-        # （LLM 常把下标数字漏掉后只剩空标签，这里统一剔除，保证 <sub>2</sub> 等
-        #   非空标签不受影响）
+        # 统一修复 <样式> -> <style>（覆盖 fallback 路径）
+        # LLM-only 成功路径在 il_translator_llm_only.py:764 已修复，
+        # 但 fallback 到传统路径时无此修复，标签泄漏到最终输出
+        translated_text = re.sub(r"<样式\s*", "<style ", translated_text)
+        translated_text = translated_text.replace("</样式>", "</style>")
+        # 清理 Markdown 标记符号（LLM 把 <style> 富文本标签误转为 **text** 等）
+        # common_rules.md 已有提示词禁止，但弱模型不可靠，需引擎级兜底
+        # 只清理 2+ 连续符号，单个 *（乘号）、_（变量名如 t_RCD）不受影响
+        translated_text = re.sub(r"\*{2,}", "", translated_text)
+        translated_text = re.sub(r"_{2,}", "", translated_text)
+        translated_text = re.sub(r"~{2,}", "", translated_text)
+        # 清理所有 <sub>/<sup> 标签（提取内容，去掉标签壳）
+        # 这些标签是 LLM 凭空生成的，引擎从不产生它们（引擎用 <style id='N'> 作富文本占位符）
+        # 空 <sup></sup> -> 空；有内容 <sup>[53]</sup> -> [53]
+        translated_text = re.sub(r"</?(?:sub|sup)>", "", translated_text)
+        # 修复被 LLM 拆成逐字符的 URL 开头（如版权声明里的 "h\nt\nt\nt\np\ns\n://"）
+        # 版权/许可声明中的长 URL 常被 LLM 逐字符换行拆开，合并回 http/https 前缀
         translated_text = re.sub(
-            r"<(?:sub|sup)>\s*</(?:sub|sup)>", "", translated_text
+            r"h\s*t\s*t\s*p\s*s?\s*:\s*/\s*/",
+            lambda m: re.sub(r"\s+", "", m.group(0)),
+            translated_text,
+            flags=re.IGNORECASE,
         )
         # 源文档（多为 MDPI）用 U+25E6 '◦'（白色圆圈）表示度符号，LLM 常把它
         # 连同 ℃ 一起输出（如 "14 ◦℃"）。这里统一归一化，避免度符号重复。
@@ -1041,6 +1063,21 @@ class ILTranslator:
             .replace("◦C", "℃")
             .replace("°℃", "℃")
         )
+        # 检测公式占位符丢失：LLM 丢弃 {vN} 占位符会导致公式内容丢失
+        # 将丢失的占位符追加到译文末尾，使 parse_translate_output 能回填公式内容
+        # （位置不理想但优于完全丢失）
+        if hasattr(translate_input, "placeholders") and translate_input.placeholders:
+            for ph in translate_input.placeholders:
+                if isinstance(ph, FormulaPlaceholder):
+                    if not re.search(
+                        ph.regex_pattern, translated_text, re.IGNORECASE
+                    ):
+                        logger.warning(
+                            f"Formula placeholder {ph.placeholder} lost in "
+                            f"translation, appending to end. "
+                            f"Paragraph debug_id: {paragraph.debug_id}"
+                        )
+                        translated_text = translated_text.rstrip() + ph.placeholder
         if translated_text == translate_input:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():
                 llm_translate_tracker.set_placeholder_full_match()

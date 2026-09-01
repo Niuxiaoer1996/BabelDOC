@@ -80,7 +80,7 @@ LINE_BREAK_REGEX = regex.compile(
     r"\uA000-\uA48F"  # Yi Syllables
     r"\uA490-\uA4CF"  # Yi Radicals
     r"'"
-    r"-"  # Hyphen
+    r"\-"  # Hyphen (escaped: 未转义时在字符类中与相邻字符构成范围，误吞 . / : 等标点)
     r"·"  # Middle Dot (U+00B7) For Català
     r"ʻ"  # Spacing Modifier Letters U+02BB
     r"]+$"
@@ -946,6 +946,7 @@ class Typesetting:
         initial_scale: float = 1.0,
         use_english_line_break: bool = True,
         apply_layout: bool = False,
+        table_barriers: list[Box] | None = None,
     ) -> tuple[float, list[TypesettingUnit] | None]:
         """查找最优缩放因子并可选择性地执行布局
 
@@ -962,6 +963,34 @@ class Typesetting:
         """
         if not paragraph.box:
             return initial_scale, None
+
+        # 收集表格单元格框（in_table_layout 段落）作为正文绕排的障碍。
+        # 正文段落排版时若某行与表格区域重叠，则右缘收窄到表格左缘，避免重叠。
+        # 仅对非表格段落生效（表格自身单元格不参与自身绕排）。
+        if table_barriers is None and page is not None and not getattr(
+            paragraph, "in_table_layout", False
+        ):
+            table_barriers = [
+                p for p in page.pdf_paragraph
+                if getattr(p, "in_table_layout", False) and p.box is not None
+            ]
+            # 表格标题（caption）常不是 in_table_layout（布局模型可能判为 plain text），
+            # 但正文第一行若与其同 y 带且全宽，会覆盖标题。用几何识别补入：
+            # 与任一 in_table 单元格在 x 上重叠 > 50%，且在 y 上紧邻（< 6pt）的段落，
+            # 视为该表格的标题，同样作为绕排障碍（正文绕开标题所在列）。
+            if table_barriers:
+                _cell_boxes = [p.box for p in table_barriers]
+                for _p in page.pdf_paragraph:
+                    if getattr(_p, "in_table_layout", False) or _p.box is None:
+                        continue
+                    _b = _p.box
+                    for _tb in _cell_boxes:
+                        _xov = min(_b.x2, _tb.x2) - max(_b.x, _tb.x)
+                        _w = min(_b.x2 - _b.x, _tb.x2 - _tb.x)
+                        if _xov > 0 and _w > 0 and _xov / _w > 0.5:
+                            if abs(_b.y2 - _tb.y) < 6 or abs(_b.y - _tb.y2) < 6:
+                                table_barriers.append(_p)
+                                break
 
         box = paragraph.box
         scale = initial_scale
@@ -980,6 +1009,7 @@ class Typesetting:
                     line_skip,
                     paragraph,
                     use_english_line_break,
+                    table_barriers,
                 )
 
                 # 如果所有单元都放得下
@@ -1070,6 +1100,7 @@ class Typesetting:
                 initial_scale,
                 use_english_line_break=False,
                 apply_layout=apply_layout,
+                table_barriers=table_barriers,
             )
 
         # 最后返回最小缩放因子
@@ -1218,6 +1249,48 @@ class Typesetting:
             logger.warning(
                 f"Failed to adjust paragraph positions on page {page.page_number}: {e}"
             )
+
+        # 避免译文渲染在图片上方：检测段落框与图片（pdf_form/pdf_figure）的重叠，
+        # 缩小段落框以避开图片区域。解决作者照片被简介文字覆盖等问题。
+        try:
+            for paragraph in page.pdf_paragraph:
+                if getattr(paragraph, "toc_role", None):
+                    continue
+                # 表格内段落不参与图片避让：表格背景/border 可能是 pdf_form，
+                # 会对所有单元格触发缩框导致内容挤压
+                if getattr(paragraph, "in_table_layout", False):
+                    continue
+                if not paragraph.box or paragraph.box.y is None:
+                    continue
+                for obj_list in (page.pdf_form, page.pdf_figure):
+                    for obj in obj_list:
+                        if obj.box is None:
+                            continue
+                        # 检查 x/y 双向重叠
+                        if not (
+                            obj.box.x < paragraph.box.x2
+                            and obj.box.x2 > paragraph.box.x
+                            and obj.box.y < paragraph.box.y2
+                            and obj.box.y2 > paragraph.box.y
+                        ):
+                            continue
+                        # 图片在段落上半部 -> 缩段落顶部至图片底部下方
+                        # 图片在段落下半部 -> 缩段落底部至图片顶部上方
+                        img_cy = (obj.box.y + obj.box.y2) / 2
+                        para_cy = (paragraph.box.y + paragraph.box.y2) / 2
+                        if img_cy > para_cy:
+                            new_y2 = obj.box.y
+                            if new_y2 < paragraph.box.y2 and new_y2 > paragraph.box.y:
+                                paragraph.box.y2 = new_y2
+                        else:
+                            new_y = obj.box.y2
+                            if new_y > paragraph.box.y and new_y < paragraph.box.y2:
+                                paragraph.box.y = new_y
+        except Exception as e:
+            logger.warning(
+                f"Failed to avoid images on page {page.page_number}: {e}"
+            )
+
         # 开始实际的渲染过程
         for paragraph in page.pdf_paragraph:
             self.render_paragraph(paragraph, page, fonts)
@@ -1310,6 +1383,7 @@ class Typesetting:
         line_skip: float,
         paragraph: il_version_1.PdfParagraph,
         use_english_line_break: bool = True,
+        table_barriers: list[Box] | None = None,
     ) -> tuple[list[TypesettingUnit], bool]:
         """布局排版单元。
 
@@ -1317,6 +1391,9 @@ class Typesetting:
             typesetting_units: 要布局的排版单元列表
             box: 布局边界框
             scale: 缩放因子
+            table_barriers: 表格单元格（in_table_layout 段落）的框列表。正文段落
+                排版时若某行 y 区间与表格单元格重叠，则该行右缘收窄到表格左缘，
+                使正文绕开表格，避免译文渲染在表格上方（LightRAG 第9页正文/表格重叠根因）。
 
         Returns:
             tuple[list[TypesettingUnit], bool]: (已布局的排版单元列表，是否所有单元都放得下)
@@ -1408,16 +1485,30 @@ class Typesetting:
             else:
                 width_before_next_break_point = 0
 
-            # 如果当前行放不下这个元素，换行
+            # 表格绕排：当前行 y 区间若与某个表格单元格重叠，则把右缘收窄到该
+            # 单元格左缘，使正文换行绕开表格（避免译文渲染在表格上方）。
+            line_right = box.x2
+            if table_barriers:
+                line_top = current_y + line_height
+                line_bottom = current_y - avg_height
+                for _tb in table_barriers:
+                    if _tb.box is None:
+                        continue
+                    # 表格单元格与当前行 y 区间重叠，且在段落左缘右侧 -> 收窄右缘
+                    if _tb.box.y < line_top and _tb.box.y2 > line_bottom:
+                        if box.x + 1 < _tb.box.x < line_right:
+                            line_right = _tb.box.x
+
+            # 如果当前行放不下这个元素，换行（右缘考虑表格绕排的 line_right）
             if not unit.is_hung_punctuation and (
-                (current_x + unit_width > box.x2)
+                (current_x + unit_width > line_right)
                 or (
                     use_english_line_break
-                    and current_x + unit_width + width_before_next_break_point > box.x2
+                    and current_x + unit_width + width_before_next_break_point > line_right
                 )
                 or (
                     unit.is_cannot_appear_in_line_end_punctuation
-                    and current_x + unit_width * 2 > box.x2
+                    and current_x + unit_width * 2 > line_right
                 )
             ):
                 # 换行

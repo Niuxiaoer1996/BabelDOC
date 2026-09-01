@@ -1508,8 +1508,12 @@ class PDFCreater:
                 if not translation_config.no_mono:
                     if translation_config.debug:
                         translation_config.raise_if_cancelled()
+                        # 解压版 PDF 是 debug 诊断产物，写入工作目录而非输出目录，
+                        # 避免污染输出文件夹（配合 --split 时也不会残留 _split_ 前缀文件）
                         pdf.save(
-                            f"{mono_out_path}.decompressed.pdf",
+                            translation_config.get_working_file_path(
+                                f"{basename}.mono.decompressed.pdf"
+                            ),
                             expand=True,
                             pretty=True,
                         )
@@ -1588,8 +1592,11 @@ class PDFCreater:
                     )
                     if translation_config.debug:
                         translation_config.raise_if_cancelled()
+                        # 解压版 PDF 是 debug 诊断产物，写入工作目录而非输出目录
                         dual.save(
-                            f"{dual_out_path}.decompressed.pdf",
+                            translation_config.get_working_file_path(
+                                f"{basename}.dual.decompressed.pdf"
+                            ),
                             expand=True,
                             pretty=True,
                         )

@@ -35,6 +35,16 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_curve_overlapping_with_paragraphs,
 )
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_same_style
+
+# 严格 bullet 模式：仅包含真正的 bullet 字符（•、◦、■ 等），
+# 不包含上标/下标数字和字母（¹²³⁴⁵⁶⁷⁸⁹⁰₁₂₃₄₅₆₇₈₉₀ᵃᵇᶜ...），
+# 也不包含数学运算符（∗·‖†‡ 等），因为后者在数学公式中常见。
+_BULLET_FOR_FORMULA_EXCLUSION = re.compile(
+    r"[\u25a0\u2022\u26ab\u2b24\u25c6\u25c7\u25cb\u25cf\u25e6"
+    r"\u2023\u2043\u25aa\u25ab\u00b6\u203b\u2042\u2055"
+    r"\u204e\u205c\u2767\u2619\u204b"
+    r"\uf09e\uf09f\uf0a7\uf0b7\uf0d8\uf0e0]"
+)
 from babeldoc.format.pdf.document_il.utils.spatial_analyzer import (
     is_element_contained_in_formula,
 )
@@ -503,6 +513,15 @@ class StylesAndFormulas:
             )
 
             is_formula = is_formula or is_corner_mark
+
+            # bullet 点字符不应被当作公式处理。
+            # bullet 字符（•、\uf09e 等）常在 Symbol/Wingdings 特殊字体中，
+            # 会被上方的 "char.pdf_style.font_id in formula_font_ids" 误判为公式，
+            # 替换成 {vN} 占位符后 LLM 翻译时可能丢弃，导致无序列表 bullet 丢失。
+            # 注意：使用严格 bullet 模式，不排除上标/下标数字（¹²³₁₂₃ 等），
+            # 因为后者在数学公式中常见。
+            if _BULLET_FOR_FORMULA_EXCLUSION.match(char.char_unicode or ""):
+                is_formula = False
 
             if char.char_unicode == " ":
                 is_formula = in_formula_state
