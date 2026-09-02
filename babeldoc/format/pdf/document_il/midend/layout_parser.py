@@ -187,25 +187,108 @@ class LayoutParser:
             clusters = babeldoc.format.pdf.document_il.utils.extract_char.process_page_chars_to_lines(
                 char_boxes
             )
-            for cluster in clusters:
-                boxes = [c[0] for c in cluster.chars]
-                min_x = min(b.x for b in boxes)
-                max_x = max(b.x2 for b in boxes)
-                min_y = min(b.y for b in boxes)
-                max_y = max(b.y2 for b in boxes)
-                cluster.chars = il_version_1.Box(min_x, min_y, max_x, max_y)
-                page_layout = il_version_1.PageLayout(
-                    id=len(exists_page_layouts) + 1,
-                    box=il_version_1.Box(
-                        min_x,
-                        min_y,
-                        max_x,
-                        max_y,
-                    ),
-                    conf=1,
-                    class_name="fallback_line",
-                )
-                exists_page_layouts.append(page_layout)
+            table_boxes = [
+                layout.box
+                for layout in exists_page_layouts
+                if layout.class_name == "table"
+            ]
+            table_of_cluster = self._assign_clusters_to_tables(clusters, table_boxes)
+            table_col_starts = self._collect_table_col_starts(
+                clusters, table_of_cluster
+            )
+            for cluster, tidx in zip(clusters, table_of_cluster):
+                if tidx >= 0 and len(cluster.chars) >= 3:
+                    char_groups = self._split_table_line_chars(
+                        cluster.chars, table_col_starts[tidx]
+                    )
+                else:
+                    char_groups = [cluster.chars]
+                for sub_chars in char_groups:
+                    boxes = [c[0] for c in sub_chars]
+                    min_x = min(b.x for b in boxes)
+                    max_x = max(b.x2 for b in boxes)
+                    min_y = min(b.y for b in boxes)
+                    max_y = max(b.y2 for b in boxes)
+                    page_layout = il_version_1.PageLayout(
+                        id=len(exists_page_layouts) + 1,
+                        box=il_version_1.Box(
+                            min_x,
+                            min_y,
+                            max_x,
+                            max_y,
+                        ),
+                        conf=1,
+                        class_name="fallback_line",
+                    )
+                    exists_page_layouts.append(page_layout)
             self._save_debug_box_to_page(page)
         finally:
             progress.advance(1)
+
+    def _assign_clusters_to_tables(
+        self, clusters, table_boxes: list[il_version_1.Box]
+    ) -> list[int]:
+        """把每个 cluster 归到其完全落于的 table 框（-1 表示不在任何表格内）。
+
+        一个 cluster（行）必须同时被 table 框的 x、y 范围完整包含，才认为它属于
+        该表格，避免把表格框外的正文段落误当作表格单元格。
+        """
+        result = []
+        for cluster in clusters:
+            if not cluster.chars:
+                result.append(-1)
+                continue
+            boxes = [c[0] for c in cluster.chars]
+            min_x = min(b.x for b in boxes)
+            max_x = max(b.x2 for b in boxes)
+            min_y = min(b.y for b in boxes)
+            max_y = max(b.y2 for b in boxes)
+            tidx = -1
+            for i, tb in enumerate(table_boxes):
+                if (
+                    tb.x <= min_x
+                    and max_x <= tb.x2
+                    and tb.y <= min_y
+                    and max_y <= tb.y2
+                ):
+                    tidx = i
+                    break
+            result.append(tidx)
+        return result
+
+    def _collect_table_col_starts(self, clusters, table_of_cluster) -> dict[int, set]:
+        """收集每个表格内各行的 x 起点，作为候选列边界。"""
+        col_starts = {}
+        for cluster, tidx in zip(clusters, table_of_cluster):
+            if tidx < 0 or not cluster.chars:
+                continue
+            min_x = min(c[0].x for c in cluster.chars)
+            col_starts.setdefault(tidx, set()).add(round(min_x, 1))
+        return col_starts
+
+    def _split_table_line_chars(self, chars, col_starts: set) -> list:
+        """表格内按列边界拆分字符。
+
+        当 DocLayout 未识别出表格单元格、fallback_line 兜底聚类把相邻列字符合并进
+        同一行（如 WDQS Phase 与 DERR0 因字符中心距 < eps 被并成一个 cell）时，
+        通过"无字符填充的 x 空隙 + 空隙右侧块起点命中表格列起点"识别列边界并拆分，
+        使相邻列内容各自成为独立的 fallback_line。
+
+        仅影响表格内 cluster；正文/普通文本无列起点可命中，保持原样不拆分。
+        """
+        if not chars:
+            return [chars]
+        ordered = sorted(chars, key=lambda c: c[0].x)
+        subgroups = []
+        cur = [ordered[0]]
+        for i in range(1, len(ordered)):
+            prev = ordered[i - 1][0]
+            curr = ordered[i][0]
+            gap = curr.x - prev.x2
+            if gap > 2.0 and any(abs(curr.x - cs) <= 1.5 for cs in col_starts):
+                subgroups.append(cur)
+                cur = [ordered[i]]
+            else:
+                cur.append(ordered[i])
+        subgroups.append(cur)
+        return subgroups

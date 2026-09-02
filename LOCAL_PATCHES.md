@@ -698,3 +698,38 @@
   布局无回归。`--layer1` 15 通过。
 - **上游价值**: 属上游普适缺陷（高优先级标题布局因边缘 IoU 吞相邻单元格字符），
   可考虑提 PR。
+
+## 30. 表格相邻列被 fallback_line 聚类合并进同一 cell（WDQS Phase 与 DERR0 挤在一格）
+
+- **症状**: JESD238B.01 表 28（"表8 — 相位检测器和DERR信号行为"）第 1 行第 2、3 列
+  错位：原文第 2 列 `WDQS Phase`、第 3 列 `DERR0`/`DERR1`，译文第 2 列变成
+  `WDQS 相位 DERR0`（DERR0 被并进第 2 列），第 3 列只剩 `DERR1`。用上一版修复
+  （补丁 29）后仍复现。
+- **根因**: DocLayout 对表 28 只检测出 `table` 框，未检测出任何 `table_cell`，表格
+  单元格全靠 `fallback_line` 兜底生成（`layout_parser.py` 的
+  `generate_fallback_line_layout_for_page`）。兜底聚类用 `_cluster_by_axis`
+  （extract_char.py），其 `LINE_CLUSTERING_EPS_MULTIPLIER = 3.5`，DBSCAN 的
+  `eps = 平均字符宽 × 3.5 ≈ 25pt`。表 28 第 4 行 `WDQS Phase`（x 至 322）与 `DERR0`
+  （x 自 332）字符中心距仅约 12pt < eps，被并进同一 cluster → 生成一个横跨第 2、3
+  列的 cell（x=261.1-367.8）。此时根本没有"第 3 列"的独立布局框，补丁 29 的
+  `get_character_layout`（在既有框之间做归属选择）无从拆分，故仍复现。
+- **修复**（`layout_parser.py` `generate_fallback_line_layout_for_page`）:
+  生成 fallback_line 时，对**完全落在某 table 框内**（x、y 均被包含）的 cluster，用
+  该表格内所有行的 x 起点作为候选**列边界**集合；若 cluster 内部存在**无字符填充的
+  x 空隙**（>2pt）且**空隙右侧块起点命中列边界**（±1.5pt），则在此处把 cluster 拆成
+  多个 fallback_line，使相邻列内容各自独立。
+  - `_assign_clusters_to_tables`：判断 cluster 归属的 table 框（需 x、y 均完整包含，
+    排除表格框外的正文）。
+  - `_collect_table_col_starts`：收集各表格内行的 x 起点作为列边界候选。
+  - `_split_table_line_chars`：按"空隙 + 右侧块起点命中列边界"拆分 cluster 字符。
+- **误拆风险评估**: 扫描 4 份文档（hopper/dally/jun2017/JESD）所有"位于表格框内"的
+  cell 内部 x 空隙分布。纯按"空隙>2pt"会误拆 18.8%（长单词如 `hiddensize`、正文句子
+  词间距）。加入"空隙右侧块起点命中列边界"后：hopper 长单词（右侧块起点 351/338/343
+  不对齐列起点）不误拆，JESD 正文列表（y 在表格框外）被排除，LightRAG 表格绕排页
+  75 个 cell 全部保持 1 块、0 误拆。正常表格 cell 内部词间距的右侧块起点几乎不可能
+  恰好等于列边界起点。
+- **验证**: JESD238B.01 `-p 42 --split` 重译，表 28 第 1 行修复为第 2 列 `WDQS相位`
+  （x261）、第 3 列 `DERR0`+`DERR1`（x332），列对齐正确且单元格全部翻译。LightRAG
+  `-p 9 --split` 表格绕排 75 cell 无回归；`--layer1` 15 通过。
+- **上游价值**: 属上游普适缺陷（表格 cell 检测缺失时，fallback_line 兜底聚类把相邻
+  列字符合并），可考虑提 PR。
