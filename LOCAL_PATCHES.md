@@ -102,7 +102,7 @@
 
 ## 6. 目录页（TOC / List of Tables / List of Figures）条目结构化处理
 
-- **Commit**: `2ff2271`（另含 `69cc002`/`e7b5d11`/`29974d2`/`7cfed40`）
+- **Commit**: 2ff2271（另含 69cc002/e7b5d11/29974d2/7cfed40/4e4dada）
 - **症状**: 目录行被当作普通段落整体送 LLM 翻译，四个问题：
   1. 章节/表/图编号被误译：裸整数 "1" 被并进标题段后 LLM 译成
      "页码1"（`merge_alternating_line_number_paragraphs` 只识别
@@ -275,8 +275,8 @@
     问题10在 parse_translate_output 回填 + post_translate 清理管线
 
 ## 11. post_translate_paragraph 统一清理管线增强（覆盖 fallback 路径 + Markdown + sub/sup + 公式丢失）
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: 多文档翻译后出现四类问题：
   1. `<样式 id='1'></样式>` 标签泄漏（Hopper GPU 论文第9页）--问题7修复在
      llm_only 路径，但 fallback 到传统路径时无修复
@@ -313,8 +313,8 @@
   4 属上游普适缺陷（公式占位符丢失无检测），可考虑提 PR
 
 ## 12. table-aware 合并保护增强：IOU 检测
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: JESD238B.01 表4/表6/表38/表39 表格内容挤压、无序列表乱行
   （第15/92/129页），单页测试正常但整篇翻译时复现
 - **根因**: `_is_in_table_layout` 用段落中心点是否在 table 版面框内判定。
@@ -328,8 +328,8 @@
 - **上游价值**: 属上游普适缺陷（表格检测精度不足），可考虑提 PR
 
 ## 13. 提示词增强：Note 翻译规则 + 代码/函数名保护
-- **Commit**: 无（位于 skill 仓库 `pdf2zh-domain/prompts/base/common_rules.md`，不在 BabelDOC）
 
+- **Commit**: 无（位于 skill 仓库 `pdf2zh-domain/prompts/base/common_rules.md`，不在 BabelDOC）
 - **症状**:
   1. JESD238B.01 图42/43/45 的 NOTE 部分乱行，"NOTE" 译法不统一
   2. NsightSystemsUserGuide 中 API 函数名、命令行工具名被翻译
@@ -341,12 +341,12 @@
   1. "参考内容处理"部分加入：NOTE/NOTE 1 -> 注/注 1，Note 内容逐行翻译不合并
   2. "不翻译的内容"部分加入：API 函数名、命令行工具名及参数、代码块内容、
      配置文件键名、camelCase/snake_case 标识符、文件路径和 URL
-- **验证**: 待翻译验证
+- **验证**: 翻译验证通过
 - **上游价值**: 属领域提示词优化，不回提上游
 
 ## 14. 图表 NOTE 多条目段落拆分
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: JESD238B.01 图42/43/45 的 NOTE 部分（NOTE 1~7）格式乱行，
   所有 NOTE 条目被翻译为一个连续段落，丢失逐行格式
 - **根因**: 版面模型将图表 Note 区域的多行 NOTE 条目归为同一布局块，
@@ -360,12 +360,12 @@
   - 新增 `_create_split_paragraph` 辅助函数：从原段落的 composition 子集
     创建新段落，继承 `pdf_style`/`layout_id`/`layout_label`/`xobj_id`
   - 仅当段落含 2+ 个 NOTE 行时才拆分，避免误拆单 NOTE 段落
-- **验证**: 待翻译验证
+- **验证**: 翻译验证通过
 - **上游价值**: 属上游普适缺陷（任何图表 NOTE 多条目场景），可考虑提 PR
 
 ## 15. bullet 点字符误判为公式导致无序列表格式乱
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: JESD238B.01 正文无序列表（第15页第2章特性、第129页 6.9.1
   HBM3 ECC features 的两级列表）格式乱行——部分列表项的 bullet 点丢失，
   子 bullet（`\uf09e`）也丢失，导致列表项内容与 bullet 错位
@@ -383,8 +383,8 @@
 - **上游价值**: 属上游普适缺陷（任何用特殊字体的 bullet 列表），可考虑提 PR
 
 ## 16. 参考文献标题正则误匹配单数 "Reference"（表格列标题）导致章节标题被跳过
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: electronics-14-02682-v2 第3页第2章标题 `2. Background and Research
   Approaches in Hybrid Bonding` 未翻译，保留英文原文
 - **根因**: `_REFERENCE_HEADER_RE` 正则 `^\s*(?:REFERENCES?|BIBLIOGRAPHY)\s*$`
@@ -395,12 +395,12 @@
 - **修复**（`paragraph_finder.py`）: `REFERENCES?` 改为 `REFERENCES`（仅复数），
   保留 `re.IGNORECASE`。`REFERENCES` 匹配 "references"/"References"/"REFERENCES"，
   不匹配 "reference"/"Reference"
-- **验证**: 待翻译验证
+- **验证**: 翻译验证通过
 - **上游价值**: 属上游普适缺陷（表格含 "Reference" 列名的文档），可考虑提 PR
 
 ## 17. 章节标题未翻译（LLM 将全大写连写词当标识符）+ 跨页翻译内容重复
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**:
   1. LightRAG 第3页标题 `3 THELIGHTRAG ARCHITECTURE` 未翻译，LLM 原样返回
   2. Evolution of GPU 第1-2页跨页段落翻译内容有重复
@@ -414,13 +414,13 @@
   2. `il_translator_llm_only.py` PROMPT_TEMPLATE：在 Structure Rules 第2条
      增加 "Each output paragraph must contain only the translation of its
      corresponding input. Do NOT repeat or overlap content from other paragraphs."
-- **验证**: 待翻译验证
+- **验证**: 翻译验证通过
 - **上游价值**: 1 属领域提示词优化；2 属上游普适缺陷（跨页 batch 翻译），
   可考虑提 PR
 
 ## 18. 页眉/页脚（abandon）段落翻译后多行布局丢失
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: JESD238B.01 页眉原文为两行（"JEDEC Standard No. 238B.01" +
   "Page 1"），翻译后合并为一行
 - **根因**: `layout_label="abandon"` 的页眉段落被正常翻译，翻译后
@@ -429,12 +429,12 @@
 - **修复**（`il_translator.py` + `il_translator_llm_only.py`）:
   两条翻译路径均跳过 `layout_label="abandon"` 段落，保持原文 composition
   和行结构 passthrough
-- **验证**: 待翻译验证
+- **验证**: 翻译验证通过，保持原文样式
 - **上游价值**: 属上游普适缺陷（页眉/页脚翻译后布局丢失），可考虑提 PR
 
 ## 19. 排版引擎不避让图片，译文覆盖作者照片
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: Evolution of GPU 第9-10页作者简介文字渲染在作者照片上方，
   文字压住图片
 - **根因**: 原文段落 box 包含照片区域（原文文字绕排照片），排版引擎在
@@ -448,8 +448,8 @@
 - **上游价值**: 属上游普适缺陷（任何文字与图片重叠的布局），可考虑提 PR
 
 ## 20. 参考文献检测扩展：支持无编号格式（arXiv 论文）
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: LightRAG 论文（arXiv 2410.05779v3）第11-12页参考文献被翻译，
   未保持原文。该论文参考文献条目以作者名开头（如 "Yichuan Li, Kaize Ding,
   and Kyumin Lee. Grenade:..."），不以 "[N]" 或 "N." 开头，不匹配
@@ -482,8 +482,8 @@
   双向验证通过）。BabelDOC 本体无需改动
 
 ## 21. 参考文献合并后重新标记 skip_translate + 表格内水平重叠段落合并 + 公式占位符追加 + 水印禁用 + 标题翻译加强
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**:
   1. electronics-14 参考文献34-37页挤在一起被翻译（只有第33页保持原文）
   2. JESD238B.01 表21/23/26/28 第一行表头单元格挤压（如"Bits"拆成"Bi"+"ts"两个段落，排版后"ts"被压扁）
@@ -506,8 +506,8 @@
 - **已知未解决**: dally2021 跨页翻译内容重复--弱模型 LLM 在跨页 batch 中重叠内容，提示词约束无效，需引擎级后处理（检测输出重叠度）
 
 ## 22. 参考文献跨页标记被 `_in_references = False` 重置破坏（全文翻译复现）
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: electronics-14 参考文献 33-37 页，全文翻译时只有第 33 页（含
   References 标题）保持原文，34-37 页（无标题续页）又被合并翻译；拆页
   翻译单页时正常。用户反馈"拆页好，全文坏"
@@ -529,8 +529,8 @@
 - **上游价值**: 属上游普适缺陷（参考文献跨页标记），可考虑提 PR
 
 ## 23. 参考文献无编号格式 + 表格行几何兜底 + URL 拆字修复
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**（Qwen 模型全文翻译复现）:
   1. electronics-14 第1页版权声明 URL 被 LLM 拆成逐字符（"h\nt\nt\nt\np\ns\n://"）
   2. 部分文档参考文献无编号开头（既非 [N]/N. 也非 arXiv 作者名），漏标
@@ -556,8 +556,8 @@
 - **上游价值**: 属上游普适缺陷（无编号参考文献、表格漏标、URL 拆字），可提 PR
 
 ## 24. 参考文献标题上方的 section 标题误触发"退出参考文献模式"，破坏跨页延续
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: electronics-14 参考文献 34-37 页被合并翻译（只有第 33 页含
   References 标题的保持原文）；拆页单页翻译正常，全文/跨页翻译复现。用户
   反馈"第 33 页正常，34-37 页合并翻译"。
@@ -586,8 +586,8 @@
   双栏/单栏论文），可提 PR
 
 ## 25. LINE_BREAK_REGEX 未转义连字符构成字符范围，误吞 . / : 等标点，导致 URL 逐字符折行
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: electronics-14 第 1 页版权声明长 URL（如
   `https://creativecommons.org/licenses/by/4.0/`）在窄栏中被**逐字符拆到
   单独一行**（渲染为 "h/t/t/p/s/:///creativecommons..."），排版极乱。
@@ -610,8 +610,8 @@
   URL/文件路径等长无空格串的断行），可提 PR
 
 ## 26. `--debug` 模式下 write_json 用 orjson 一次性序列化整篇 IL 触发 MemoryError
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: 对密集大文档（JESD238B.01）执行 `--debug` 时，在
   `_do_translate_single` 的 `xml_converter.write_json(...)` 处抛
   `MemoryError` 直接中断整个翻译。命令行：
@@ -642,8 +642,8 @@
 - **上游价值**: 属上游普适缺陷（`--debug` 对密集大文档内存溢出），可提 PR
 
 ## 27. `--debug` 模式下 .decompressed.pdf 解压版产物污染输出目录
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: 使用 `--debug`（尤其配合 `--split`）翻译后，输出目录除了正常产物
   （`.zh.mono.pdf`/`.zh.dual.pdf`/`.zh.glossary.csv`）外，还残留两个
   `*.decompressed.pdf`（mono/dual 各一）解压诊断文件；配合 `--split` 时还带
@@ -660,8 +660,8 @@
 - **上游价值**: 属上游行为偏好（诊断文件进输出目录），可考虑提 PR 或保留本地。
 
 ## 28. 正文段落与表格重叠：排版时正文不绕开表格区域
-- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 
+- **Commit**: `91c6699`（该补丁代码合并于此批量提交）
 - **症状**: LightRAG 第 9 页第 4.5 节，正文段落（"我们从两个关键角度…"）的译文
   渲染在右侧表格（Figure 2）上方，两者重叠，正文覆盖表格内容。源文档该节为
   "左栏正文 + 右栏表格 + 表格下方通栏续接"的混合布局，正文段落框被版面模型判为
@@ -693,8 +693,8 @@
 - **上游价值**: 属上游普适缺陷（任何"正文跨表格栏"场景），可考虑提 PR。
 
 ## 29. 表格表头"描述"列被误归入 table_caption，导致表头错位（Bit描述/描述列空白）
-- **Commit**: `064295f`
 
+- **Commit**: `064295f`
 - **症状**: JESD238B.01 多个表格（表11/18/21/23/26/27/28/29/31）的**表头行**
   （Field/Bits/Description/Notes）译文错位：表头第2列（Bits）内容变成"Bit描述"
   （Bits 与 Description 挤在一起），第3列（描述）空白。同一文档中有的表格表头
@@ -719,8 +719,8 @@
   可考虑提 PR。
 
 ## 30. 表格相邻列被 fallback_line 聚类合并进同一 cell（WDQS Phase 与 DERR0 挤在一格）
-- **Commit**: `f812808`
 
+- **Commit**: `f812808`
 - **症状**: JESD238B.01 表 28（"表8 — 相位检测器和DERR信号行为"）第 1 行第 2、3 列
   错位：原文第 2 列 `WDQS Phase`、第 3 列 `DERR0`/`DERR1`，译文第 2 列变成
   `WDQS 相位 DERR0`（DERR0 被并进第 2 列），第 3 列只剩 `DERR1`。用上一版修复
