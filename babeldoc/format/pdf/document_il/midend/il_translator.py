@@ -47,6 +47,24 @@ from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecu
 logger = logging.getLogger(__name__)
 
 
+# 图表标题分隔符保护：正文中 "Figure 1 — Title" / "Table 1 – Title" 的标题段。
+# 源 PDF 图表标题常用 em-dash(—)/en-dash(–) 等作标题与编号间的分隔符，
+# LLM 翻译时不稳定地改写为 "." / "。" 等，导致同文档内分隔符不统一。
+# 翻译前把该分隔符替换为受保护占位符 {vSEP}（LLM 被要求保留占位符），
+# 翻译后恢复为原文分隔符，保证严格跟随原文。
+_TOC_TITLE_SEP_RE = re.compile(
+    r"^(?P<prefix>(?:Figure|FIG|FIGURE|Table|TAB|TABLE)\s+\d+)\s*"
+    r"(?P<sep>[—–\-.:,])\s+"
+)
+# 兜底修正：LLM 丢弃 {vSEP} 占位符时，把译文里的 "图N."/"图N。" 等改回原文分隔符
+# 注意：不用 lookbehind（Python re 不支持可变宽度 lookbehind），改用捕获组，
+# 替换时保留 group(1)（图/表+编号）并接回分隔符。
+_TOC_TITLE_SEP_FIX_RE = re.compile(
+    r"((?:图|表)\s*\d+)\s*[.。:：、,，·•]"
+)
+_TOC_TITLE_SEP_PLACEHOLDER = "{vSEP}"
+
+
 PROMPT_TEMPLATE = Template(
     """$role_block
 
@@ -632,6 +650,17 @@ class ILTranslator:
                     [],
                     paragraph.pdf_style,
                 )
+                m = _TOC_TITLE_SEP_RE.match(translate_input.unicode or "")
+                if m:
+                    sep = m.group("sep")
+                    start = m.start("sep")
+                    end = m.end("sep")
+                    translate_input.unicode = (
+                        translate_input.unicode[:start]
+                        + _TOC_TITLE_SEP_PLACEHOLDER
+                        + translate_input.unicode[end:]
+                    )
+                    translate_input.toc_sep = sep
                 translate_input.set_original_placeholder_tokens(
                     original_placeholder_tokens,
                 )
@@ -1082,6 +1111,16 @@ class ILTranslator:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():
                 llm_translate_tracker.set_placeholder_full_match()
             return False
+        if getattr(translate_input, "toc_sep", None):
+            sep = translate_input.toc_sep
+            if _TOC_TITLE_SEP_PLACEHOLDER in translated_text:
+                translated_text = translated_text.replace(
+                    _TOC_TITLE_SEP_PLACEHOLDER, sep
+                )
+            else:
+                translated_text = _TOC_TITLE_SEP_FIX_RE.sub(
+                    lambda mm: f"{mm.group(1)} {sep}", translated_text
+                )
         paragraph.unicode = translated_text
         paragraph.pdf_paragraph_composition = self.parse_translate_output(
             translate_input,

@@ -753,3 +753,34 @@
   `-p 9 --split` 表格绕排 75 cell 无回归；`--layer1` 15 通过。
 - **上游价值**: 属上游普适缺陷（表格 cell 检测缺失时，fallback_line 兜底聚类把相邻
   列字符合并），可考虑提 PR。
+
+## 31. 图表标题/目录页标题分隔符被 LLM 改写，导致同文档内不统一
+
+- **Commit**: 待提交
+- **症状**: JESD238B.01 正文图表标题与目录页（List of Tables/Figures）标题段，原文
+  分隔符统一为 em-dash `—`/en-dash `–`（如 `Table 1 – Single Channel`），译文里被
+  LLM 不稳定地改写为 `.`、`。`、`：` 等（如 `表1. 单通道信号计数`、`图39。时钟至WDQS`），
+  同文档内分隔符不统一。跨引擎都存在（免费引擎 0827 有 90 处 `。`，Qwen 更多），
+  只是概率不同，非引擎差异。
+- **根因**: 正文图表标题（figure_caption/table_caption）与目录页标题段
+  （toc_role="title"）都是普通段落，整体送 LLM 翻译（toc_processor 只剥离
+  toc_role="layout" 的点线/页码，toc_role="title" 保留 `Table N <sep> Title` 走
+  il_translator 正常流程）。LLM 翻译时把标题与编号间的分隔符随意改写。
+- **修复**（`il_translator.py`）:
+  1. 模块级正则 `_TOC_TITLE_SEP_RE` 匹配 `^(Figure|Table)\s+\d+\s*([—–\-.:,])\s+`
+     开头的段落（单 composition 分支，即 `get_translate_input` 中
+     `len(pdf_paragraph_composition)==1` 处），把分隔符替换为受保护占位符 `{vSEP}`，
+     并记录原文分隔符到 `translate_input.toc_sep`。
+  2. `translate_paragraph` 在 `parse_translate_output` 之前恢复：若译文中含
+     `{vSEP}` 则 replace 回原文 sep；若 LLM 丢弃占位符，用兜底正则
+     `_TOC_TITLE_SEP_FIX_RE`（`((?:图|表)\s*\d+)\s*[.。:：、,，·•]`）修正为原文 sep。
+  3. 注意：兜底正则**不能用 lookbehind**（Python re 不支持可变宽度 lookbehind，
+     会运行时报错 `re.error: look-behind requires fixed-width pattern`），改用捕获组
+     group(1) 保留"图/表+编号"。
+- **验证**: 正则单测通过（匹配保护 + LLM 保留占位符恢复 + LLM 丢弃占位符兜底修正）。
+  真实翻译验证因环境内存不足（`ONNXRuntimeError Failed to allocate memory`，机器同时
+  跑多个翻译进程）未完成，待验证。
+- **上游价值**: 属上游普适缺陷（任何文档图表标题分隔符被 LLM 改写），可考虑提 PR。
+- **注意**: 与 `pdf2zh-domain` 的 common_rules.md 原"图表标题编号后用英文句点 `表1.`"
+  规则冲突，已在 common_rules.md 同步改为"严格跟随原文分隔符"（引擎层保护优先级更高，
+  提示词规则仅为兜底）。
