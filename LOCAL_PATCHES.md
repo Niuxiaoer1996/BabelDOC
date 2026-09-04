@@ -756,7 +756,7 @@
 
 ## 31. 图表标题/目录页标题分隔符被 LLM 改写，导致同文档内不统一
 
-- **Commit**: 待提交
+- **Commit**: `be5531a`
 - **症状**: JESD238B.01 正文图表标题与目录页（List of Tables/Figures）标题段，原文
   分隔符统一为 em-dash `—`/en-dash `–`（如 `Table 1 – Single Channel`），译文里被
   LLM 不稳定地改写为 `.`、`。`、`：` 等（如 `表1. 单通道信号计数`、`图39。时钟至WDQS`），
@@ -784,3 +784,41 @@
 - **注意**: 与 `pdf2zh-domain` 的 common_rules.md 原"图表标题编号后用英文句点 `表1.`"
   规则冲突，已在 common_rules.md 同步改为"严格跟随原文分隔符"（引擎层保护优先级更高，
   提示词规则仅为兜底）。
+
+## 32. LLM-only 批量翻译路径无段落级缓存，中断/超时后需全文重翻
+
+- **Commit**: `b0e8685`
+- **症状**: 走 LLM-only 路径（`il_translator_llm_only.py`，LLM 批量翻译）翻译整篇大文档时，
+  每跑一次所有段落都要重新调用 LLM；中途超时/被杀（如 Qwen 超时被 kill）后，已翻译内容全丢，
+  重跑需从头再翻，耗时且浪费 token。传统路径（`il_translator.py`）有缓存，LLM-only 路径原本没有。
+- **根因**: `ILTranslatorLLMOnly.translate_paragraph` 没有复用翻译缓存，翻译前不查缓存、
+  翻译后不落库。
+- **修复**（`il_translator_llm_only.py` `translate_paragraph`）:
+  1. 翻译前按 (engine, params, original_text) 查 SQLite `cache.v1.db`，命中则跳过该段；
+  2. 翻译后写入缓存落库；全部命中则跳过 LLM 请求；fresh id 重映射。
+- **验证**: 段落级缓存生效，重跑只翻译未缓存部分（断点续传）。
+- **上游价值**: 属通用增强（大文档断点续传），可考虑提 PR。
+
+## 33. 排版修复批次：列表分段 / 嵌套碎片合并 / 句中连词续接 / 下标续接 / 表标题字号
+
+- **Commit**: `b0e8685`
+- **症状**: 多类排版问题（`paragraph_finder.py` + `typesetting.py`）：
+  - 有序/无序列表项被并成一行，`1.2.3.` 编号与多 bullet 项不独立；
+  - 布局模型偶发把父段内字符切成分段，译文叠印；
+  - 句中切分后以下段大写/连词续接（如 "static LOW and / HIGH levels"）无法合并；
+  - 下标片段（如 "t" + "INIT2"）被切分，独立段渲染时下标起始定位偏移产生大间距；
+  - 图表/节标题布局框只包住 cap-height，渲染需字号×line_skip，高度不足导致 scale 被压小、
+    标题字号过小。
+- **修复**（`paragraph_finder.py`）:
+  - `_split_bullets_in_merged_lines`：多 bullet 并行项拆行后再走行级拆段；
+    `_is_list_item_start`/`_paragraph_is_list_item_start` 保护列表项独立。
+  - `merge_nested_fragment_paragraphs`：合并 box 嵌套/行级交叠的碎片段落（按视觉行重排）。
+  - `merge_mid_sentence_continuation_paragraphs`：连词/逗号结尾放宽（`_CONTINUATION_CONJUNCTIONS`），
+    允许下段大写续接；排除列表项。
+  - `merge_title_caption_and_table_fragments`：下标续接（b 行高 < a×0.75 且紧贴）。
+  - （`typesetting.py`）`_expand_caption_box_height` + `_paragraph_font_size`：
+    caption/title 类段落 box 高度扩展到单行渲染所需高度，避免 scale 压小。
+- **验证**: 列表项独立（第26页 `1.2.3.`、第15页 18 个 bullet 项）、句中续接合并、
+  下标间距修复、表7/8标题字号恢复正常。
+- **上游价值**: 属上游普适缺陷（布局模型碎片化/标题字号），可考虑提 PR。
+
