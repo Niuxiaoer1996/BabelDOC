@@ -298,6 +298,12 @@ class ParagraphFinder:
         # 合并为一个段落。LLM 翻译整段后逐行格式丢失。按 "NOTE N" 行拆分。
         self.split_note_paragraphs(paragraphs)
 
+        # 第三步 3/4：拆分"多个无序列表项被并成一行"的行
+        # 行分组 threading 扫描对行距紧/字符 y 重叠的列表会把多个垂直
+        # 排列的 bullet 项并成一行（"• A • B • C"），使行级列表项拆分失效。
+        # 按 bullet 字符拆行后再走行级拆段。
+        self._split_bullets_in_merged_lines(paragraphs)
+
         # 第四步：计算所有行宽度的中位数
         median_width = self.calculate_median_line_width(paragraphs)
 
@@ -343,6 +349,12 @@ class ParagraphFinder:
             and getattr(self.translation_config, "merge_alternating_line_numbers", True)
         ):
             self.merge_alternating_line_number_paragraphs(paragraphs)
+
+        # 新增后处理：合并 box 嵌套在父段内的碎片段落（布局模型偶发嵌套输出，
+        # 碎片独立翻译后与父段译文叠印，父段文本缺失且顺序错乱）。必须在
+        # 水平合并之前执行（先恢复完整父段，再处理水平相邻片段）。
+        if not toc_page:
+            self.merge_nested_fragment_paragraphs(paragraphs)
 
         # 新增后处理：合并同一行被水平切分的标题/图题片段，以及表格单元格内的垂直多行
         if (
@@ -510,6 +522,26 @@ class ParagraphFinder:
     def _paragraph_first_char(self, p: PdfParagraph) -> str:
         text = self._paragraph_text_ascii(p).lstrip()
         return text[0] if text else ""
+
+    def _paragraph_is_list_item_start(self, p: PdfParagraph) -> bool:
+        """判断段落是否以列表项标记开头（有序 1./a) 或无序 bullet）。
+
+        供 merge_mid_sentence_continuation_paragraphs 排除列表项，避免
+        "a) xxx" 这类列表项（小写字母开头）被误当作句中续接段落重新合并。
+        """
+        text = self._paragraph_text_ascii(p).lstrip()
+        if not text:
+            return False
+        if bool(ParagraphFinder._ORDERED_LIST_ITEM_RE.match(text)):
+            return True
+        # 无序 bullet：取首个字符判断
+        try:
+            comps = p.pdf_paragraph_composition or []
+            if comps and comps[0].pdf_line and comps[0].pdf_line.pdf_character:
+                return is_bullet_point(comps[0].pdf_line.pdf_character[0])
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def _estimate_line_pitch(p: PdfParagraph) -> float | None:
@@ -816,6 +848,148 @@ class ParagraphFinder:
                 chars.extend(comp.pdf_formula.pdf_character)
         return get_char_unicode_string(chars)
 
+    # 允许嵌套合并的正文类布局标签（排除标题/图题/表格等特殊类）
+    _NESTABLE_TEXT_LABELS = {
+        "plain text", "text", "content", "fallback_line", "paragraph",
+    }
+
+    def _resplit_paragraph_lines_sorted(self, paragraph: PdfParagraph):
+        """把段落的所有行打平成字符池，按视觉行重新分组并按 x 排序。
+
+        用于嵌套碎片并回父段后恢复原文阅读顺序：父段的行与碎片的行
+        在 y 上互嵌（同一视觉行被拆进不同段落），简单 extend 会导致
+        字符顺序错乱；按 (y 行分组, 行内 x 排序) 重建行才能恢复。
+        """
+        all_chars = []
+        for comp in paragraph.pdf_paragraph_composition or []:
+            if comp.pdf_line:
+                all_chars.extend(comp.pdf_line.pdf_character or [])
+            elif comp.pdf_character:
+                all_chars.append(comp.pdf_character)
+        if not all_chars:
+            return
+        # 按视觉行分组：y 中心排序后，相邻中心差 > 4pt 视为新行
+        # （同一行内正常字符/下标中心差 < ~3pt，相邻行差 ≈ 行距 > 10pt）
+        all_chars.sort(
+            key=lambda c: (-(c.box.y + c.box.y2) / 2, c.box.x)
+        )
+        rows = []
+        cur_row = []
+        cur_cy = None
+        for ch in all_chars:
+            cy = (ch.box.y + ch.box.y2) / 2
+            if cur_row and cur_cy is not None and abs(cy - cur_cy) > 4.0:
+                rows.append(cur_row)
+                cur_row = []
+            cur_row.append(ch)
+            cur_cy = cy
+        if cur_row:
+            rows.append(cur_row)
+        # 行内按 x 排序，重建 composition
+        new_comps = []
+        for row in rows:
+            row.sort(key=lambda c: c.box.x)
+            new_comps.append(self.create_line(row))
+        paragraph.pdf_paragraph_composition = new_comps
+        self.update_paragraph_data(paragraph)
+
+    def merge_nested_fragment_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """合并 box 嵌套/交叠在父段内的碎片段落（布局模型嵌套输出）。
+
+        布局模型偶尔把父段内部的字符（如行中间的续接文本、下标）
+        切成独立段落，其 box 与父段 box 重叠。父段文本因此缺失中间
+        片段且顺序错乱，碎片独立翻译后渲染时叠印在父段译文上
+        （译文重叠不可读）。
+
+        条件（保守）：
+        - b 的 box 完全嵌套在 a 的 box 内（x/y 均包含，容差 1pt）；
+          或行级交叠：b 的 y 范围包含于 a（或反之）且 x 重叠 > 0，
+          且较小段面积 < 较大段的 60%（一大一小的碎片特征）
+        - 同 xobj、同布局标签、均为正文类标签（plain text/text 等）
+        - 排除表格/参考文献/skip_translate 段落
+        合并方式：小段 composition 并入大段后按视觉行重分组 + 行内
+        x 排序，恢复原文顺序。
+        """
+        if not paragraphs or len(paragraphs) < 2:
+            return
+        i = 0
+        while i < len(paragraphs):
+            a = paragraphs[i]
+            if (
+                a.box is None
+                or not a.pdf_paragraph_composition
+                or (a.layout_label or "") not in self._NESTABLE_TEXT_LABELS
+                or getattr(a, "in_table_layout", False)
+                or getattr(a, "skip_translate", False)
+            ):
+                i += 1
+                continue
+            merged_any = False
+            j = 0
+            while j < len(paragraphs):
+                if j == i:
+                    j += 1
+                    continue
+                b = paragraphs[j]
+                if (
+                    b.box is None
+                    or not b.pdf_paragraph_composition
+                    or b.xobj_id != a.xobj_id
+                    or (b.layout_label or "") not in self._NESTABLE_TEXT_LABELS
+                    or getattr(b, "in_table_layout", False)
+                    or getattr(b, "skip_translate", False)
+                ):
+                    j += 1
+                    continue
+                nested = (
+                    b.box.x >= a.box.x - 1
+                    and b.box.x2 <= a.box.x2 + 1
+                    and b.box.y >= a.box.y - 1
+                    and b.box.y2 <= a.box.y2 + 1
+                )
+                if not nested:
+                    # 行级交叠：一方 y 范围包含于另一方 + x 重叠 > 0
+                    # + 面积比 < 60%（一大一小的碎片特征）
+                    x_ov = min(a.box.x2, b.box.x2) - max(a.box.x, b.box.x)
+                    y_b_in_a = (
+                        b.box.y >= a.box.y - 1 and b.box.y2 <= a.box.y2 + 1
+                    )
+                    y_a_in_b = (
+                        a.box.y >= b.box.y - 1 and a.box.y2 <= b.box.y2 + 1
+                    )
+                    area_a = (a.box.x2 - a.box.x) * (a.box.y2 - a.box.y)
+                    area_b = (b.box.x2 - b.box.x) * (b.box.y2 - b.box.y)
+                    if (
+                        x_ov > 0
+                        and (y_b_in_a or y_a_in_b)
+                        and area_a > 0
+                        and area_b > 0
+                        and (
+                            min(area_a, area_b) / max(area_a, area_b) < 0.6
+                        )
+                    ):
+                        nested = True
+                if not nested:
+                    j += 1
+                    continue
+                area_a = (a.box.x2 - a.box.x) * (a.box.y2 - a.box.y)
+                area_b = (b.box.x2 - b.box.x) * (b.box.y2 - b.box.y)
+                if area_a <= 0 or area_b <= 0 or area_b > area_a * 0.5:
+                    j += 1
+                    continue
+                # 并回父段并按视觉行重排，恢复原文顺序
+                a.pdf_paragraph_composition.extend(b.pdf_paragraph_composition)
+                self._resplit_paragraph_lines_sorted(a)
+                del paragraphs[j]
+                merged_any = True
+                logger.info(
+                    "Merged nested fragment"
+                    f" {b.debug_id} into {a.debug_id}."
+                )
+                # 不推进 j，继续检查是否还有其他嵌套碎片
+            if not merged_any:
+                i += 1
+
     def merge_title_caption_and_table_fragments(
         self, paragraphs: list[PdfParagraph]
     ):
@@ -887,7 +1061,19 @@ class ParagraphFinder:
                     and len((a.unicode or "")) <= 60
                     and len((b.unicode or "")) <= 80
                 )
-                if not (is_lower_cont or is_title_pair):
+                # 下标/上标续接：b 与 a 同行紧贴且 b 行高明显小于 a
+                # （如 "t" + 下标 "INIT2" 被版面切成两个水平片段）。
+                # b 是 a 行末词的下标部分，必须并回 a，否则独立段渲染
+                # 时下标起始定位偏移，产生大间距（t 与 INIT2 间隔异常）。
+                h_a = self._last_line_height(a)
+                h_b = self._first_line_height(b)
+                is_subscript_cont = bool(
+                    first_ch.isalnum()
+                    and h_a
+                    and h_b
+                    and h_b < h_a * 0.75
+                )
+                if not (is_lower_cont or is_title_pair or is_subscript_cont):
                     continue
                 if abs(h_gap) < best_gap:
                     best_j, best_gap = j, abs(h_gap)
@@ -1022,14 +1208,30 @@ class ParagraphFinder:
                             or a.xobj_id != b.xobj_id
                             or (a.layout_label or "") != (b.layout_label or "")
                             or b.first_line_indent
+                            or self._paragraph_is_list_item_start(b)
                         ):
                             continue
                         first_ch = self._paragraph_first_char(b)
                         h_b = self._first_line_height(b)
+                        # 连词/逗号结尾放宽：a 以逗号或连词（and/or/with/to/of...）
+                        # 结尾时，允许 b 以大写开头续接（正常句子不会以连词结尾，
+                        # "static LOW and / HIGH levels" 这类句中切分可正确合并）
+                        a_text_r = self._paragraph_text_ascii(a).rstrip()
+                        a_last_word = (
+                            re.split(r"\s+", a_text_r)[-1].lower().strip(".,;:")
+                            if a_text_r
+                            else ""
+                        )
+                        allow_upper_cont = a_text_r.endswith(",") or (
+                            a_last_word
+                            in self._CONTINUATION_CONJUNCTIONS
+                        )
                         if (
                             not first_ch
                             or not first_ch.isalpha()
-                            or not first_ch.islower()
+                            or not (
+                                first_ch.islower() or allow_upper_cont
+                            )
                             or not h_b
                             or not 0.6 <= h_a / h_b <= 1.6
                         ):
@@ -1480,6 +1682,110 @@ class ParagraphFinder:
             return (line_widths[mid - 1] + line_widths[mid]) / 2
         return line_widths[mid]
 
+    # 有序列表项起始标记（行首）：如 "1. " "2) " "a) " "b. " 等。
+    # 数字/字母后接 . 、) 或 ）、并跟空白，作为列表项开头。
+    # 要求后跟空白，避免把 "Figure 5." "R[3:0]." 等正文误判为列表项。
+    _ORDERED_LIST_ITEM_RE = re.compile(
+        r"^(?:\d+|[a-zA-Z])\s*[.、)）]\s+"
+    )
+
+    # 句中续接连词：段落以这些词结尾（无句末标点）时，视为明显的句中切分，
+    # 允许下一段以大写字母开头续接合并（正常完整句子不会以连词结尾）。
+    _CONTINUATION_CONJUNCTIONS = {
+        "and", "or", "but", "with", "to", "of", "for", "the", "a", "an",
+        "in", "on", "by", "from", "at", "as", "when", "while", "if",
+        "that", "which", "whose", "than", "during", "before", "after",
+        "between", "within", "into", "onto", "over", "under", "not",
+    }
+
+    @staticmethod
+    def _is_list_item_start(chars: list) -> bool:
+        """判断一行字符是否以列表项标记开头（有序如 1./a)，或无序 bullet）。
+
+        chars: pdf_line.pdf_character 列表（PdfCharacter，含 char_unicode）。
+        """
+        if not chars:
+            return False
+        first = chars[0]
+        # 无序 bullet 点
+        try:
+            if is_bullet_point(first):
+                return True
+        except Exception:
+            pass
+        # 有序列表标记：取行首若干字符拼文本匹配
+        prefix = "".join(
+            getattr(c, "char_unicode", "") for c in chars[:6]
+        )
+        return bool(ParagraphFinder._ORDERED_LIST_ITEM_RE.match(prefix))
+
+    def _split_bullets_in_merged_lines(self, paragraphs: list[PdfParagraph]):
+        """把"多个无序列表项被并成一行"的行按 bullet 字符拆开。
+
+        行分组（_split_paragraph_into_lines 的 threading 扫描）要求行间隙
+        完全无字符才能分行；行距紧或 bullet 字符 y 略低时相邻行的间隙
+        消失，多个垂直排列的 bullet 项会被并成一行（如
+        "• A • B • C"）。此处检测行内 >=2 个 bullet 字符且分属不同视觉行
+        （y 中心差超过阈值），按 bullet 字符把行字符切成多组、重组为
+        多行，使后续行级列表项拆分（process_independent_paragraphs）
+        能够生效。
+        """
+        for paragraph in paragraphs:
+            comps = paragraph.pdf_paragraph_composition
+            if not comps or len(comps) < 1:
+                continue
+            if getattr(paragraph, "in_table_layout", False) or getattr(
+                paragraph, "skip_translate", False
+            ):
+                continue
+            new_comps = []
+            changed = False
+            for comp in comps:
+                line = comp.pdf_line
+                if not line or not line.pdf_character:
+                    new_comps.append(comp)
+                    continue
+                chars = list(line.pdf_character)
+                bullet_idx = [
+                    k for k, c in enumerate(chars) if is_bullet_point(c)
+                ]
+                if len(bullet_idx) < 2:
+                    new_comps.append(comp)
+                    continue
+                # bullet 的 y 中心；不同视觉行的 bullet 中心差 ≈ 行距（>10pt），
+                # 同一行内多个 bullet 中心差 ≈ 0。阈值 3pt 区分两者。
+                centers = []
+                for k in bullet_idx:
+                    y1, y2 = self._get_effective_y_bounds(chars[k])
+                    centers.append((y1 + y2) / 2)
+                multi_visual_rows = any(
+                    abs(centers[m + 1] - centers[m]) > 3.0
+                    for m in range(len(centers) - 1)
+                )
+                if not multi_visual_rows:
+                    new_comps.append(comp)
+                    continue
+                # 按 bullet 切分：每组从 bullet 开始到下一个 bullet 前；
+                # 第一个 bullet 之前的前缀字符（若有）单独成组
+                first = bullet_idx[0]
+                groups = []
+                if first > 0:
+                    groups.append(chars[:first])
+                for gi, k in enumerate(bullet_idx):
+                    end = (
+                        bullet_idx[gi + 1]
+                        if gi + 1 < len(bullet_idx)
+                        else len(chars)
+                    )
+                    groups.append(chars[k:end])
+                for g in groups:
+                    if g:
+                        new_comps.append(self.create_line(g))
+                changed = True
+            if changed:
+                paragraph.pdf_paragraph_composition = new_comps
+                self.update_paragraph_data(paragraph)
+
     def process_independent_paragraphs(
         self,
         paragraphs: list[PdfParagraph],
@@ -1530,7 +1836,8 @@ class ParagraphFinder:
                     paragraphs.insert(i + 1, new_paragraph)
                     break
 
-                # 如果前一行宽度小于中位数的一半，将当前行及后续行分割成新段落
+                # 如果前一行宽度小于中位数的一半，将当前行及后续行分割成新段落；
+                # 或当前行以列表项标记开头（有序 1./a) 或无序 bullet），强制拆出新段落
                 if (
                     self.translation_config.split_short_lines
                     and prev_width
@@ -1540,8 +1847,7 @@ class ParagraphFinder:
                     and (current_line := paragraph.pdf_paragraph_composition[j])
                     and (line := current_line.pdf_line)
                     and (chars := line.pdf_character)
-                    and (char := chars[0])
-                    and is_bullet_point(char)
+                    and self._is_list_item_start(chars)
                 ):
                     # 创建新的段落
                     new_paragraph = PdfParagraph(

@@ -938,6 +938,74 @@ class Typesetting:
                 "document_scales is empty, there seems no paragraph in this PDF"
             )
 
+    # 标题/图题类布局标签：布局框常只包住大写字母高度（cap-height ≈ 字号×0.7），
+    # 渲染一行需要 字号×line_skip，高度不足导致 scale 被错误压小、译文标题字号过小。
+    _CAPTION_LIKE_LABELS = {
+        "table_caption", "figure_caption", "chart_title", "table_title",
+        "figure_title", "title", "doc_title", "paragraph_title",
+    }
+
+    @staticmethod
+    def _paragraph_font_size(paragraph) -> float | None:
+        """取段落原始字号的中位数（用于 caption 类 box 高度修正）。
+
+        覆盖两类 composition：原始字符（pdf_line.pdf_character /
+        pdf_character）与译文 unicode 单元（pdf_same_style_unicode_
+        characters，其 pdf_style.font_size 承自原文 base_style）。
+        """
+        sizes = []
+        for comp in paragraph.pdf_paragraph_composition or []:
+            if comp.pdf_line:
+                chars = comp.pdf_line.pdf_character or []
+            elif comp.pdf_character:
+                chars = [comp.pdf_character]
+            else:
+                chars = []
+            for ch in chars:
+                fs = getattr(getattr(ch, "pdf_style", None), "font_size", None)
+                if fs:
+                    sizes.append(fs)
+            if comp.pdf_same_style_unicode_characters:
+                fs = getattr(
+                    getattr(
+                        comp.pdf_same_style_unicode_characters,
+                        "pdf_style",
+                        None,
+                    ),
+                    "font_size",
+                    None,
+                )
+                if fs:
+                    sizes.append(fs)
+        if not sizes:
+            return None
+        sizes.sort()
+        return sizes[len(sizes) // 2]
+
+    def _expand_caption_box_height(
+        self, box: Box, paragraph, line_skip: float
+    ) -> Box:
+        """caption/title 类段落：把 box 高度扩展到单行渲染所需高度。
+
+        布局框只含 cap-height（如 11pt 字号框高仅 7.7pt），而一行渲染
+        需要 字号×line_skip ≈ 16.5pt，scale 因此被压到 0.4-0.5（标题
+        字号过小）。表格/图表标题上下通常有空白，上下均分扩展安全。
+        """
+        if box is None:
+            return box
+        _label = paragraph.layout_label or ""
+        if _label not in self._CAPTION_LIKE_LABELS:
+            return box
+        font_size = self._paragraph_font_size(paragraph)
+        if not font_size:
+            return box
+        need_h = font_size * line_skip
+        cur_h = box.y2 - box.y
+        if need_h > cur_h > 0:
+            expand = (need_h - cur_h) / 2
+            return Box(box.x, box.y - expand, box.x2, box.y2 + expand)
+        return box
+
     def _find_optimal_scale_and_layout(
         self,
         paragraph: il_version_1.PdfParagraph,
@@ -995,6 +1063,8 @@ class Typesetting:
         box = paragraph.box
         scale = initial_scale
         line_skip = 1.50 if self.is_cjk else 1.3
+        # caption/title 类段落高度修正（布局框只含 cap-height，见方法注释）
+        box = self._expand_caption_box_height(box, paragraph, line_skip)
         min_scale = 0.1
         expand_space_flag = 0
         final_typeset_units = None

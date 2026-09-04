@@ -689,15 +689,39 @@ class ILTranslatorLLMOnly:
                 paragraph_unicodes.append(paragraph.unicode)
             if not inputs:
                 return
+            # 段落级翻译缓存（上游 llm_only 批量路径无缓存，中断重跑/二次
+            # 验证时全量重翻代价大）。先按段查缓存，命中的直接注入结果；
+            # 仅未命中段组批请求，结果逐段落库（复用 translator 的 SQLite 缓存）。
+            _cache = getattr(self.translate_engine, "cache", None)
+            _ignore_cache = bool(
+                getattr(self.translate_engine, "ignore_cache", False)
+            )
+            cached_results: dict[int, str] = {}
+            fresh_inputs: list[tuple[int, list]] = []
+            if _cache is not None and not _ignore_cache:
+                for id_, input_item in enumerate(inputs):
+                    try:
+                        hit = _cache.get(input_item[0])
+                    except Exception:
+                        hit = None
+                    if hit is not None:
+                        cached_results[id_] = hit
+                    else:
+                        fresh_inputs.append((id_, input_item))
+            else:
+                fresh_inputs = [
+                    (id_, input_item) for id_, input_item in enumerate(inputs)
+                ]
+
             json_format_input = []
 
-            for id_, input_text in enumerate(inputs):
+            for fresh_id, (orig_id, input_text) in enumerate(fresh_inputs):
                 ti: il_translator.ILTranslator.TranslateInput = input_text[1]
                 tracker: ParagraphTranslateTracker = input_text[3]
-                tracker.record_multi_paragraph_index(id_)
+                tracker.record_multi_paragraph_index(orig_id)
                 placeholders_hint = ti.get_placeholders_hint()
                 obj = {
-                    "id": id_,
+                    "id": fresh_id,
                     "input": input_text[0],
                     "layout_label": input_text[2].layout_label,
                 }
@@ -708,47 +732,67 @@ class ILTranslatorLLMOnly:
                     obj["formula_placeholders_hint"] = placeholders_hint
                 json_format_input.append(obj)
 
-            json_format_input_str = json.dumps(
-                json_format_input, ensure_ascii=False, indent=2
-            )
+            if cached_results and not json_format_input:
+                # 全部段落命中缓存，无需发起 LLM 请求
+                translation_results = cached_results
+            else:
+                json_format_input_str = json.dumps(
+                    json_format_input, ensure_ascii=False, indent=2
+                )
 
-            batch_text_for_glossary_matching = "\n".join(
-                item.get("input", "") for item in json_format_input
-            )
+                batch_text_for_glossary_matching = "\n".join(
+                    item.get("input", "") for item in json_format_input
+                )
 
-            final_input = self._build_llm_prompt(
-                json_input_str=json_format_input_str,
-                title_paragraph=title_paragraph,
-                local_title_paragraph=local_title_paragraph,
-                batch_text_for_glossary_matching=batch_text_for_glossary_matching,
-            )
+                final_input = self._build_llm_prompt(
+                    json_input_str=json_format_input_str,
+                    title_paragraph=title_paragraph,
+                    local_title_paragraph=local_title_paragraph,
+                    batch_text_for_glossary_matching=batch_text_for_glossary_matching,
+                )
 
-            for llm_translate_tracker in llm_translate_trackers:
-                llm_translate_tracker.set_input(final_input)
-            llm_output = self.translate_engine.llm_translate(
-                final_input,
-                rate_limit_params={
-                    "paragraph_token_count": paragraph_token_count,
-                    "request_json_mode": True,
-                },
-            )
-            for llm_translate_tracker in llm_translate_trackers:
-                llm_translate_tracker.set_output(llm_output)
-            llm_output = llm_output.strip()
+                for llm_translate_tracker in llm_translate_trackers:
+                    llm_translate_tracker.set_input(final_input)
+                llm_output = self.translate_engine.llm_translate(
+                    final_input,
+                    rate_limit_params={
+                        "paragraph_token_count": paragraph_token_count,
+                        "request_json_mode": True,
+                    },
+                )
+                for llm_translate_tracker in llm_translate_trackers:
+                    llm_translate_tracker.set_output(llm_output)
+                llm_output = llm_output.strip()
 
-            llm_output = self._clean_json_output(llm_output)
+                llm_output = self._clean_json_output(llm_output)
 
-            parsed_output = json.loads(llm_output)
+                parsed_output = json.loads(llm_output)
 
-            if isinstance(parsed_output, dict) and parsed_output.get(
-                "output", parsed_output.get("input", False)
-            ):
-                parsed_output = [parsed_output]
+                if isinstance(parsed_output, dict) and parsed_output.get(
+                    "output", parsed_output.get("input", False)
+                ):
+                    parsed_output = [parsed_output]
 
-            translation_results = {
-                item["id"]: item.get("output", item.get("input"))
-                for item in parsed_output
-            }
+                fresh_results = {
+                    item["id"]: item.get("output", item.get("input"))
+                    for item in parsed_output
+                }
+
+                if len(fresh_results) != len(fresh_inputs):
+                    raise Exception(
+                        f"Translation results length mismatch. Expected: {len(fresh_inputs)}, Got: {len(fresh_results)}"
+                    )
+
+                # 映射回原始段索引并写入缓存
+                translation_results = dict(cached_results)
+                for fresh_id_, output in fresh_results.items():
+                    orig_id_, input_item = fresh_inputs[int(fresh_id_)]
+                    translation_results[orig_id_] = output
+                    if _cache is not None and not _ignore_cache:
+                        try:
+                            _cache.set(input_item[0], output)
+                        except Exception:
+                            pass
 
             if len(translation_results) != len(inputs):
                 raise Exception(
