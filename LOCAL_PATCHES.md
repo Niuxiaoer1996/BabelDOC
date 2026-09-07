@@ -867,4 +867,23 @@
   `Level A`/`RFM is required`/`RAAIMT_A` 三列，各自独立翻译；表36 其他 cell 无回归。
 - **上游价值**: 属上游普适缺陷（fallback_line 聚类合并相邻列，含异常宽空格），可考虑提 PR。
 
+## 36. merge_mid_sentence 增加括号续接豁免（问题7的部分增强）
+
+- **Commit**: `cb47644`
+- **症状**: 问题7（JESD238B 第23页初始化步骤第2小点译文叠印）的碎片中，续接段常以 `)` 等
+  右括号开头且 `first_line_indent=True`、与上一段垂直重叠，导致 `merge_mid_sentence_continuation_paragraphs`
+  的常规判定（要求小写字母开头 / 无缩进 / 垂直相邻 gap）全部拦截，无法合并。
+- **根因**: 布局把含括号内容的句子切成两段（如 `"2. RESET...VDDQ"` + `") before..."`），
+  续接段以 `)` 开头（非字母），且布局对续接段误设 `first_line_indent`，垂直重叠（gap 为负）。
+- **修复**（`paragraph_finder.py` `merge_mid_sentence_continuation_paragraphs`）:
+  新增 `is_paren_cont`：当 a 文本末尾存在未闭合左括号（`(` 数 > `)` 数）且 b 以 `)`/`]` 开头时，
+  豁免"小写字母开头"与 `first_line_indent`，并允许 b 与 a 垂直重叠（gap 为负）。
+  仅在这种明确括号续接形态下放宽，不影响普通续接判定。
+- **验证**: 单测：用真实段落（`"2. RESET...VDDQ"` + `") before..."`，b 带 `first_line_indent=True`）
+  跑 `merge_mid_sentence_continuation_paragraphs`，两段成功合并成一段。对正常段落无误合并。
+  **注意**: 该修复对**已聚合的完整文本段**有效；但问题7（全篇翻译叠印）的根因是 merge 执行时
+  第 2 小点还是未聚合的碎片（见 README 问题7），此改动未能完全解决全篇叠印，作为合理增强保留，
+  问题7整体挂起待深排。
+- **上游价值**: 属上游普适缺陷（布局把括号内容切段），可考虑提 PR。
+
 
