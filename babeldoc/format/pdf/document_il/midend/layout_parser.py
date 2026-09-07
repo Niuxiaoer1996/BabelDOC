@@ -271,21 +271,36 @@ class LayoutParser:
 
         当 DocLayout 未识别出表格单元格、fallback_line 兜底聚类把相邻列字符合并进
         同一行（如 WDQS Phase 与 DERR0 因字符中心距 < eps 被并成一个 cell）时，
-        通过"无字符填充的 x 空隙 + 空隙右侧块起点命中表格列起点"识别列边界并拆分，
-        使相邻列内容各自成为独立的 fallback_line。
+        通过以下任一信号识别列边界并拆分，使相邻列内容各自成为独立的 fallback_line：
+        - 无字符填充的 x 空隙较大（gap > 8pt，明显大于正常字间距），或
+        - 空隙右侧块起点命中表格列起点（保留原有逻辑，gap > 2pt 且命中列起点），或
+        - 存在异常宽的空格字符（宽度 > 8pt，正常空格约 2.5pt，宽空格是列分隔填充）。
 
-        仅影响表格内 cluster；正文/普通文本无列起点可命中，保持原样不拆分。
+        仅影响表格内 cluster；正文/普通文本无列起点可命中、无大空隙/宽空格，保持原样不拆分。
         """
         if not chars:
             return [chars]
         ordered = sorted(chars, key=lambda c: c[0].x)
+        # 正常空格宽度约 2.5pt；列分隔常以异常宽空格（制表/填充）占据，宽度显著大于正常
         subgroups = []
         cur = [ordered[0]]
         for i in range(1, len(ordered)):
-            prev = ordered[i - 1][0]
-            curr = ordered[i][0]
-            gap = curr.x - prev.x2
-            if gap > 2.0 and any(abs(curr.x - cs) <= 1.5 for cs in col_starts):
+            prev_box, prev_uni = ordered[i - 1][0], ordered[i - 1][1]
+            curr_box, curr_uni = ordered[i][0], ordered[i][1]
+            gap = curr_box.x - prev_box.x2
+            # 异常宽空格：当前字符是空格且宽度显著大于正常空格（列分隔填充）
+            wide_space = (
+                curr_uni == " "
+                and curr_box.x2 - curr_box.x > 8.0
+            )
+            if (
+                wide_space
+                or gap > 8.0
+                or (
+                    gap > 2.0
+                    and any(abs(curr_box.x - cs) <= 1.5 for cs in col_starts)
+                )
+            ):
                 subgroups.append(cur)
                 cur = [ordered[i]]
             else:
