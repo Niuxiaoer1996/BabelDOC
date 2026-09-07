@@ -886,4 +886,22 @@
   问题7整体挂起待深排。
 - **上游价值**: 属上游普适缺陷（布局把括号内容切段），可考虑提 PR。
 
+## 37. 段落 xobj_id 为 None 时兜底为 0，修复 "Xobj id must be provided when unicode is provided"
+
+- **Commit**: `a090ce4`
+- **症状**: 翻译 NB25036-MRCD02_Spec.pdf（421 页）时，在 Typesetting 阶段报错
+  `Xobj id must be provided when unicode is provided`，翻译中断。
+- **根因**: `create_typesetting_units` 创建译文字符的 `TypesettingUnit` 时用
+  `xobj_id=paragraph.xobj_id`（typesetting.py），构造器在 `unicode` 提供时断言
+  `xobj_id is not None`。个别段落（如幽灵段/纯译文段）的 `xobj_id` 为 None
+  （`PdfParagraph.xobj_id` 默认 None，`update_paragraph_data` 在 chars 为空时提前
+  return 不设置 xobj_id），导致触发断言错误。
+- **修复**:
+  - `typesetting.py` `create_typesetting_units`：开头若 `paragraph.xobj_id is None`
+    则兜底为 0（主页面内容，安全）。
+  - `paragraph_finder.py` `_group_characters_into_paragraphs`：创建段落时从当前字符
+    继承 `xobj_id`（None 则用 0），从源头减少 None。
+- **验证**: NB25036-MRCD02_Spec.pdf（421 页）完整翻译通过，不再报错。
+- **上游价值**: 属上游普适缺陷（幽灵/纯译文段 xobj_id 缺失），可考虑提 PR。
+
 
