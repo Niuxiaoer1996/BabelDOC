@@ -842,4 +842,29 @@
   肉眼确认表5-8 标题字号正常可读。
 - **上游价值**: 属上游普适缺陷（表格绕排误伤标题段落），可考虑提 PR。
 
+## 35. 表格相邻列被聚类合并（表36 Level A/B/C 行的第2/3/4列）
+
+- **Commit**: `2d1bbc0`
+- **症状**: JESD238B.01 第68页表36 第3/4/5行（Level A/B/C）的第2/3/4列内容被合并成一个
+  单元格翻译：原文 `Level A`（第2列）、`RFM is required`（第3列）、`RAAIMT_A`（第4列）
+  被并成 `Level A RFM is required RAAIMT_A` 一起翻译。第4行（Default 行）正常（各列独立）。
+- **根因**: 表格单元格检测缺失时 fallback_line 兜底聚类（`_cluster_by_axis`）用 DBSCAN
+  `eps = 平均字宽 × 3.5`（约 35pt）。Level A/B/C 行的列间空隙约 13-14pt < eps，被聚成
+  同一个 cluster（cell）。补丁30 的拆分逻辑 `_split_table_line_chars` 依赖"空隙 > 2pt 且
+  右侧块起点命中其他行列起点"，但 Level 行的第3/4列起点（x≈172.8、x≈254.4）与其他行的
+  列起点（177.7、259.4）不对齐，col_starts 不命中，拆分失效。且 RFM 与 RAAIMT_A 之间的
+  列分隔是一个**宽度 13pt 的异常空格字符**（正常空格约 2.5pt），把空隙填充导致 gap 检测
+  不到。
+- **修复**（`layout_parser.py` `_split_table_line_chars`）:
+  拆分信号扩展为三种（任一命中即拆）：
+  1. `gap > 8pt`：无字符填充的大空隙（明显大于正常字间距 ~0）；
+  2. 保留原有 `gap > 2pt 且命中 col_starts`；
+  3. **异常宽空格**（`curr_uni==' '` 且空格宽度 > 8pt）：列分隔常以异常宽空格
+     （制表/填充）占据，识别为列边界。
+  阈值 8pt 经验证：表格内正常 cell（Default/RAAIMT/RAAMMT_A 等）内部无 >8pt 的空格或
+  空隙，仅 Level A/B/C 行触发拆分，无误拆。
+- **验证**: JESD238B.01 `-p 68 --split --debug` 重译，表36 第3/4/5行拆成独立的
+  `Level A`/`RFM is required`/`RAAIMT_A` 三列，各自独立翻译；表36 其他 cell 无回归。
+- **上游价值**: 属上游普适缺陷（fallback_line 聚类合并相邻列，含异常宽空格），可考虑提 PR。
+
 
