@@ -1557,8 +1557,11 @@ class Typesetting:
 
             # 表格绕排：当前行 y 区间若与某个表格单元格重叠，则把右缘收窄到该
             # 单元格左缘，使正文换行绕开表格（避免译文渲染在表格上方）。
+            # 标题/图题类段落（table_caption/figure_caption 等）不参与：标题应横跨
+            # 表格上方完整宽度居中显示，收窄会让一行放不下译文、scale 被压小
+            # （标题字号过小，如 JESD238B 表5-8）。
             line_right = box.x2
-            if table_barriers:
+            if table_barriers and (paragraph.layout_label or "") not in self._CAPTION_LIKE_LABELS:
                 line_top = current_y + line_height
                 line_bottom = current_y - avg_height
                 for _tb in table_barriers:
