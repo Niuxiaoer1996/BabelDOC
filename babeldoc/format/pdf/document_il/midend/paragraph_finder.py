@@ -1207,7 +1207,6 @@ class ParagraphFinder:
                             or getattr(b, "skip_translate", False)
                             or a.xobj_id != b.xobj_id
                             or (a.layout_label or "") != (b.layout_label or "")
-                            or b.first_line_indent
                             or self._paragraph_is_list_item_start(b)
                         ):
                             continue
@@ -1226,12 +1225,26 @@ class ParagraphFinder:
                             a_last_word
                             in self._CONTINUATION_CONJUNCTIONS
                         )
+                        # 括号续接：a 末尾存在未闭合的左括号（如 "below 0.2 × VDDQ" 前是
+                        # "(below..."），b 以 ")" 闭合（布局把括号内容切成两段，b 以右括号
+                        # 开头、非字母，常规续接判定失效）。此时 b 是 a 的句中续接，豁免
+                        # "小写字母开头"与 first_line_indent，并允许 b 与 a 垂直重叠。
+                        a_open = a_text_r.count("(") - a_text_r.count(")")
+                        is_paren_cont = bool(
+                            first_ch in ")]"
+                            and a_open > 0
+                        )
                         if (
                             not first_ch
-                            or not first_ch.isalpha()
                             or not (
-                                first_ch.islower() or allow_upper_cont
+                                first_ch.isalpha() or is_paren_cont
                             )
+                            or not (
+                                first_ch.islower()
+                                or allow_upper_cont
+                                or is_paren_cont
+                            )
+                            or (not is_paren_cont and b.first_line_indent)
                             or not h_b
                             or not 0.6 <= h_a / h_b <= 1.6
                         ):
@@ -1239,10 +1252,13 @@ class ParagraphFinder:
                         gap = a.box.y - b.box.y2  # b 在 a 正下方
                         x_overlap = min(a.box.x2, b.box.x2) - max(a.box.x, b.box.x)
                         min_w = min(a.box.x2 - a.box.x, b.box.x2 - b.box.x)
+                        # 括号续接的垂直重叠：b 的 box 与 a 底部对齐、覆盖下方多行，
+                        # gap 为负；此时仍应允许合并。
                         if (
                             min_w > 0
                             and x_overlap > 0.5 * min_w
-                            and -2 <= gap <= pitch * 1.3
+                            and gap <= pitch * 1.3
+                            and (is_paren_cont or -2 <= gap)
                             and gap < best_gap
                         ):
                             best_j, best_gap = j, gap
