@@ -1641,6 +1641,12 @@ class Typesetting:
     ) -> list[TypesettingUnit]:
         if not paragraph.pdf_paragraph_composition:
             return []
+        # 防御：个别段落（如幽灵段/纯译文段）xobj_id 可能为 None，
+        # 创建译文字符的 TypesettingUnit 时 xobj_id=None 会触发
+        # "Xobj id must be provided when unicode is provided" 校验错误。
+        # xobj_id=0 表示主页面内容，作为兜底安全。
+        if paragraph.xobj_id is None:
+            paragraph.xobj_id = 0
         result = []
 
         @cache

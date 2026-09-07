@@ -1359,6 +1359,7 @@ class ParagraphFinder:
                     layout_id=current_layout.id,
                     debug_id=generate_base58_id(),
                     layout_label=current_layout.name,
+                    xobj_id=char.xobj_id if char.xobj_id is not None else 0,
                 )
                 paragraphs.append(current_paragraph)
 
