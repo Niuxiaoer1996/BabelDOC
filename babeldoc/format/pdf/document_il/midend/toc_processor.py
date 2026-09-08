@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 
 _LEADER_CHARS = ".。\u2024\u2025"
 _LEADER_RUN = re.compile(r"[" + _LEADER_CHARS + r"]{3,}")
+# 宽松点线：2+ 连续点。layout 模型可能把合并块最后一个条目的点线截短成 2 个点
+# （如 "Figure 167: ... Push-Pull .."），故条目边界用 2 点即可识别。
+_LEADER_RUN_LOOSE = re.compile(r"[" + _LEADER_CHARS + r"]{2,}")
 
 # 完整目录条目：标题 + 3+ 点引导线 + 页码（匹配前先 strip，坐标用 lead 偏移换算）
 _ENTRY_RE = re.compile(
@@ -61,6 +64,8 @@ _INLINE_WORD_NUM_RE = re.compile(
 _DOTS_PAGE_RE = re.compile(r"^[" + _LEADER_CHARS + r"]{3,}\s*(\d+)\s*$")
 # 纯编号行："1" / "3.1" / "6.2.1.1"
 _NUMBER_RE = re.compile(r"^[\d.]+\s*$")
+# 目录条目起点（编号前缀）："Figure 74" / "Table 332"（标题开头）
+_ENTRY_TOKEN_RE = re.compile(r"(?:Figure|TABLE|Table|FIGURE)\s*\d+")
 
 # 可能被 layout 模型合并进条目的页标题前缀（顺序敏感：长的在前）
 _PAGE_HEADERS = (
@@ -105,15 +110,19 @@ class TOCProcessor:
         ] = []
 
     def _count_dotted_lines(self, page: il_version_1.Page) -> int:
-        """统计页面上包含点引导线（3+ 连续点）的行数。"""
+        """统计页面上的点引导线（3+ 连续点）run 数量。
+
+        按 run 计数而非段落计数：layout 模型可能把多个目录条目合并进同一段落
+        （每段含多个点线 run，如物理28 的合并块），按段落计数会低估点线行数，
+        导致目录尾页（条目少但每块含多条）被 _TOC_MIN_DOTTED_LINES 误判为非目录页。
+        """
         n = 0
         for para in page.pdf_paragraph or []:
             chars = self._para_chars(para)
             if not chars:
                 continue
             text = "".join(c.char_unicode for c in chars)
-            if _LEADER_RUN.search(text):
-                n += 1
+            n += len(_LEADER_RUN.findall(text))
         return n
 
     # ------------------------------------------------------------------
@@ -215,13 +224,74 @@ class TOCProcessor:
     # ------------------------------------------------------------------
     # 条目拆分
     # ------------------------------------------------------------------
+    def _filter_title_outliers(
+        self, chars: list[il_version_1.PdfCharacter]
+    ) -> list[il_version_1.PdfCharacter]:
+        """剔除标题段中混入的离群残留字符。
+
+        layout 模型把多个目录条目合并进同一段落时，会把相邻条目的极少量字符
+        （下标/装饰/上一行残留）混入当前标题字符集。这些字符几何 y 与标题主体
+        相差超过一行，会撑大 title 段 box，导致 normalize_boxes 误判为"多行标题"
+        并锚定到错误 y，造成标题重叠、后续错位。
+        本方法按 y 聚类成行簇，只剔除"字符数远少于主簇且跨行孤立"的残留簇，
+        保留字符量可观的行（含正常多行标题的每一行）。
+        """
+        if not chars:
+            return chars
+        from collections import Counter
+
+        boxes = [self._char_box(c) for c in chars]
+        # 行高 = 字符高度众数
+        hs = Counter(
+            round(b.y2 - b.y, 1)
+            for b in boxes
+            if b is not None and b.y is not None and b.y2 is not None
+        )
+        line_h = max(hs.items(), key=lambda kv: kv[1])[0] if hs else 10.0
+        if line_h <= 0:
+            line_h = 10.0
+        # 按 y 聚类成行簇（相邻 y 差 < 半行高视为同一行）
+        items = sorted(
+            [(b.y, c) for c, b in zip(chars, boxes) if b is not None and b.y is not None],
+            key=lambda t: t[0],
+        )
+        if len(items) < 2:
+            return chars
+        clusters: list[list[tuple[float, il_version_1.PdfCharacter]]] = []
+        cur = [items[0]]
+        for item in items[1:]:
+            if item[0] - cur[-1][0] < line_h * 0.5:
+                cur.append(item)
+            else:
+                clusters.append(cur)
+                cur = [item]
+        clusters.append(cur)
+        # 主簇 = 字符数最多的行簇
+        main = max(clusters, key=len)
+        main_y = sum(i[0] for i in main) / len(main)
+        keep_ids: set[int] = set()
+        for cl in clusters:
+            cl_y = sum(i[0] for i in cl) / len(cl)
+            # 只剔除：字符数极少（<5 个，多为下标/装饰/残留）且 y 距主簇跨行
+            # （正常多行标题的每一行字符数通常 >=5，不会被误删）
+            if len(cl) < 5 and abs(cl_y - main_y) > line_h:
+                continue
+            keep_ids.update(id(c) for _, c in cl)
+        return [c for c in chars if id(c) in keep_ids]
+
     def _build_paragraph(
         self,
         chars: list[il_version_1.PdfCharacter],
         base: il_version_1.PdfParagraph,
         toc_role: str | None,
     ) -> il_version_1.PdfParagraph:
-        """用给定字符子集构造新段落（单行）。"""
+        """用给定字符子集构造新段落（单行）。
+
+        标题段会剔除几何离群的残留字符（见 _filter_title_outliers），
+        避免混入相邻条目字符导致 box 撑大、标题重叠错位。
+        """
+        if toc_role == "title":
+            chars = self._filter_title_outliers(chars)
         line = il_version_1.PdfLine(pdf_character=chars)
         line.box = self._compute_box(chars)
         para = il_version_1.PdfParagraph(
@@ -243,35 +313,99 @@ class TOCProcessor:
 
     def _iter_entry_spans(self, text: str):
         """从左到右扫描文本，产出每个目录条目的
-        (title_s, title_e, leader_s, leader_e, page_e) 绝对下标。
+        (title_s, title_e, leader_s, leader_e, page_s, page_e) 绝对下标
+        （page_s/page_e 为 None 表示无页码）。
 
-        处理 layout 模型把多个相邻条目合并进同一段落的情况（标题内嵌
-        "点线+页码+下一条目"，如 "Figure 28 ... 52 Figure 29 ... 7"）。
+        layout 模型可能把多个相邻目录条目合并进同一段落，有两种结构：
+        - 常规（页码在点线后）：[title][dots][page][next title]...
+          涵盖章节目录（"3.25.1 Power up .... 92 3.25.2 Mux Mode .... 93"）、
+          JESD 图目录（"Figure 28 ... 52 Figure 29 ... 7"）等。
+        - 页码前移（NB25036 图目录块首，布局模型把页码剥离并移到标题前）：
+          [page][title][dots][page][title][dots]...
+        两者在"点线+数字+下一条目"层面无法区分，故以"块首是否有前移页码"
+        判别：块首有页码 => 前移结构，按 Figure/Table 边界切分；
+        否则 => 常规结构，按点线驱动切分。
         """
-        pos = 0
+        tokens = [m.start() for m in _ENTRY_TOKEN_RE.finditer(text)]
+        if tokens:
+            first = tokens[0]
+            leading_page = re.search(r"(\d+)\s*$", text[:first])
+            if leading_page is not None:
+                # 前移结构：页码在标题前，按 Figure/Table 边界切分
+                yield from self._iter_entry_spans_shifted(text, tokens)
+                return
+        # 常规结构（章节块 / JESD / 单条目）：点线驱动切分
+        yield from self._iter_entry_spans_dotted(text)
+
+    def _iter_entry_spans_dotted(self, text: str):
+        """点线驱动切分（常规结构，页码在点线后）。
+
+        每个目录条目 = [标题][3+点线][页码]；点线后紧跟页码，页码后是下一条目。
+        适用于章节目录（无 Figure/Table 前缀）、JESD 图目录、以及单条目。
+        """
         n = len(text)
+        pos = 0
         while pos < n:
-            m = _ENTRY_RE.match(text[pos:])
-            if not m:
+            lm = _LEADER_RUN_LOOSE.search(text, pos)
+            if not lm:
                 break
-            title_s = pos + m.start("title")
-            title_e = pos + m.end("title")
-            leader_s = pos + m.start("leader")
-            leader_e = pos + m.end("leader")
-            page_e = pos + m.end("page")
-            # 标题内嵌另一条目的点线（两条目合并成一段）
-            inner = _LEADER_RUN.search(text[title_s:title_e])
-            if inner:
-                inner_s = title_s + inner.start()
-                inner_e = title_s + inner.end()
-                m2 = re.match(r"\s*(\d+)", text[inner_e:])
-                if m2:
-                    first_page_e = inner_e + m2.end()
-                    yield (title_s, inner_s, inner_s, inner_e, first_page_e)
-                    pos = first_page_e
-                    continue
-            yield (title_s, title_e, leader_s, leader_e, page_e)
-            pos = page_e
+            title_s, title_e = pos, lm.start()
+            leader_s, leader_e = lm.start(), lm.end()
+            m2 = re.match(r"\s*(\d+)", text[leader_e:])
+            if m2:
+                page_s = leader_e + m2.start(1)
+                page_e = leader_e + m2.end()
+                pos = page_e
+            else:
+                # 点线后无页码（标题内含点线或末尾残缺）：仅到点线为止
+                page_s = page_e = None
+                pos = leader_e
+            yield (title_s, title_e, leader_s, leader_e, page_s, page_e)
+        # 兜底：点线驱动结束后，若已切出过条目（pos>0，说明是合并块）且剩余文本
+        # 非空，剩余内容应为未处理条目（其点线被布局模型损坏/截短导致上述循环
+        # 未覆盖），补充切出，避免长标题/末尾条目的标题整行丢失。
+        if pos > 0 and pos < n:
+            rest_tokens = [m.start() for m in _ENTRY_TOKEN_RE.finditer(text, pos)]
+            if rest_tokens:
+                # 图/表目录：按 Figure/Table token 切分剩余条目
+                for k, s in enumerate(rest_tokens):
+                    next_s = rest_tokens[k + 1] if k + 1 < len(rest_tokens) else n
+                    yield (s, next_s, next_s, next_s, None, None)
+            else:
+                # 章节目录（无 Figure/Table 前缀）：剩余文本整体作为一个 title，
+                # 剥离尾部点线/页码残留
+                rest = text[pos:].strip()
+                if rest:
+                    end = n
+                    m = re.search(r"[\s" + re.escape(_LEADER_CHARS) + r"\d]+$", rest)
+                    if m:
+                        end = pos + m.start()
+                    yield (pos, end, end, end, None, None)
+
+    def _iter_entry_spans_shifted(self, text: str, tokens: list[int]):
+        """前移结构切分（页码在标题前，NB25036 图目录块首）。
+
+        结构：[page][Figure N: title][dots][page][Figure N+1: title][dots]...
+        每条目标题从 Figure/Table N 起，页码 = 其 Figure/Table 前的数字。
+        """
+        n = len(text)
+        for i, s in enumerate(tokens):
+            next_s = tokens[i + 1] if i + 1 < len(tokens) else n
+            seg = text[s:next_s]
+            lm = _LEADER_RUN_LOOSE.search(seg)
+            if lm:
+                title_e = s + lm.start()
+                leader_s = s + lm.start()
+                leader_e = s + lm.end()
+            else:
+                # 无点线（末尾残缺条目或纯标题段）：标题到下一个 token / 末尾
+                title_e = next_s
+                leader_s = leader_e = next_s
+            # 前移结构：本条目页码 = 其 Figure/Table 前的数字
+            pm = re.search(r"(\d+)\s*$", text[:s])
+            page_s = pm.start(1) if pm else None
+            page_e = pm.end() if pm else None
+            yield (s, title_e, leader_s, leader_e, page_s, page_e)
 
     def _split_entry(
         self,
@@ -281,7 +415,8 @@ class TOCProcessor:
         title_e: int,
         leader_s: int,
         leader_e: int,
-        page_e: int,
+        page_s: int | None,
+        page_e: int | None,
         base: il_version_1.PdfParagraph,
     ) -> tuple[
         list[il_version_1.PdfCharacter],
@@ -293,6 +428,8 @@ class TOCProcessor:
         - 页眉前缀（"Contents (cont'd)" 等）剥离为独立普通段；
         - 行内裸整数编号（"1 Scope ...." 中的 "1"）剥离到布局段；
         - "Table N -"/"Figure N -"/"6.2.1.1" 等前缀留在标题段（LLM 可靠保留/本地化）。
+        - 布局段 = 点线 + 页码；页码可能位于标题之前（前移结构，page_s<page_e
+          与点线不连续，故单独收集）。
         """
         # 1) 页眉前缀剥离
         header_end = title_s
@@ -317,11 +454,106 @@ class TOCProcessor:
                 inline_num_end = header_end + rest_lead + m3.start("title")
 
         title_chars = chars[inline_num_end:title_e]
-        layout_chars = list(chars[leader_s:page_e])
+        # 布局段 = 点线 + 页码（页码在前移结构下位于标题之前，单独收集）
+        layout_chars = list(chars[leader_s:leader_e])
+        if page_s is not None and page_e is not None:
+            layout_chars += list(chars[page_s:page_e])
         if inline_num_end > header_end:
             layout_chars = list(chars[header_end:inline_num_end]) + layout_chars
         header_chars = list(chars[title_s:header_end]) if header_end > title_s else []
         return title_chars, layout_chars, header_chars
+
+    def _merge_left_title_fragment(
+        self,
+        prev: il_version_1.PdfParagraph,
+        title_chars: list[il_version_1.PdfCharacter],
+        entry_title_x: float,
+        entry_y: float,
+    ) -> tuple[list[il_version_1.PdfCharacter], bool]:
+        """合并 result 中同一行的左邻标题残片到 title_chars 开头。
+
+        layout 模型可能把长标题横向切成2段（如 "2 Mechanical Ou" + "tline (...)"、
+        "Absolute Maxi" + "mum Ratings"），右侧段被识别为 title（有 layout 配对），
+        左侧段 role=None 残片。本方法把左邻残片合并到 title 开头，恢复完整标题。
+        返回 (合并后字符, 是否合并)。
+        """
+        if not prev or prev.box is None:
+            return title_chars, False
+        prev_chars, prev_text = self._para_chars_text(prev)
+        if not prev_chars:
+            return title_chars, False
+        prev_stripped = prev_text.strip()
+        if not prev_stripped:
+            return title_chars, False
+        # 残片不含点线/纯编号/页眉
+        if _LEADER_RUN.search(prev_text):
+            return title_chars, False
+        if _NUMBER_RE.match(prev_stripped):
+            return title_chars, False
+        if self._match_header_prefix(prev_stripped):
+            return title_chars, False
+        # 同行（y 差 < 行高）
+        prev_y = prev.box.y or 0
+        line_h = (prev.box.y2 or prev_y) - prev_y
+        if line_h <= 0:
+            line_h = 10.0
+        if abs(prev_y - entry_y) > line_h:
+            return title_chars, False
+        # x 相邻：前段 x2 与当前 title x 差 <= 2pt（无缝）
+        prev_x2 = prev.box.x2 or 0
+        if abs(prev_x2 - entry_title_x) > 2.0:
+            return title_chars, False
+        return prev_chars + title_chars, True
+
+    def _collect_orphan_title_fragment(
+        self,
+        result: list[il_version_1.PdfParagraph],
+        layout: il_version_1.PdfParagraph,
+    ) -> list[il_version_1.PdfParagraph]:
+        """从 result 末尾向上收集与 layout 段同一行、x 相邻的标题残片段。
+
+        layout 模型可能把章节目录条目拆成 [标题段1][标题段2][点线+页码段]
+        （如 "Absolute Maxi" + "mum Ratings" + "......32"），标题与点线完全分离，
+        无任何段落含完整"标题+点线+页码"，点线驱动无法识别。本方法以点线+页码
+        layout 段为锚点，收集其左侧同一行、x 无缝相邻、无点线/编号/页眉的
+        未配对残片段（从左到右返回列表），供调用者合并为标题。
+        """
+        if layout.box is None:
+            return []
+        lay_box = layout.box
+        line_h = (lay_box.y2 or 0) - (lay_box.y or 0)
+        if line_h <= 0:
+            line_h = 10.0
+        frags: list[il_version_1.PdfParagraph] = []
+        for prev in reversed(result):
+            if prev.box is None:
+                break
+            if prev.toc_role not in (None, "normal"):
+                break
+            prev_chars, prev_text = self._para_chars_text(prev)
+            if not prev_chars:
+                break
+            prev_stripped = prev_text.strip()
+            if not prev_stripped:
+                break
+            # 含点线 / 纯编号 / 页眉：非残片
+            if _LEADER_RUN.search(prev_text):
+                break
+            if _NUMBER_RE.match(prev_stripped):
+                break
+            if self._match_header_prefix(prev_stripped):
+                break
+            # 同行（y 差 < 行高）
+            prev_y = prev.box.y or 0
+            if abs(prev_y - (lay_box.y or 0)) > line_h:
+                break
+            # x 相邻：前段 x2 与 layout x 差 <= 2pt（无缝）
+            prev_x2 = prev.box.x2 or 0
+            if abs(prev_x2 - (lay_box.x or 0)) > 2.0:
+                break
+            frags.append(prev)
+        frags.reverse()
+        return frags
 
     def _is_continuation_candidate(
         self,
@@ -403,14 +635,17 @@ class TOCProcessor:
                 continue
             lead = len(text) - len(text.lstrip())
 
-            # 1) 纯编号段：不翻译（il_translator 的 is_pure_numeric 跳过），原样保留
-            if _NUMBER_RE.match(stripped):
+            # 1) 点线+页码独立段：布局段（比纯编号更具体，需先于 _NUMBER_RE 判断，
+            #    否则 "......32" 会被 _NUMBER_RE 当成纯编号提前截走）。
+            #    与标题残片段的配对在末尾 post-pass（_pair_orphan_layouts）统一处理，
+            #    因为残片段可能因 y 微差排在点线段之后，循环内看不到。
+            if _DOTS_PAGE_RE.match(stripped):
+                para.toc_role = "layout"
                 result.append(para)
                 continue
 
-            # 2) 点线+页码独立段：布局段
-            if _DOTS_PAGE_RE.match(stripped):
-                para.toc_role = "layout"
+            # 2) 纯编号段：不翻译（il_translator 的 is_pure_numeric 跳过），原样保留
+            if _NUMBER_RE.match(stripped):
                 result.append(para)
                 continue
 
@@ -418,9 +653,9 @@ class TOCProcessor:
             #    合并进同一段落，逐条拆分）
             spans = list(self._iter_entry_spans(text))
             if spans:
-                for idx, (title_s, title_e, leader_s, leader_e, page_e) in enumerate(spans):
+                for idx, (title_s, title_e, leader_s, leader_e, page_s, page_e) in enumerate(spans):
                     title_chars, layout_chars, header_chars = self._split_entry(
-                        chars, text, title_s, title_e, leader_s, leader_e, page_e, para
+                        chars, text, title_s, title_e, leader_s, leader_e, page_s, page_e, para
                     )
                     # 多行标题续接：把上方同列的续接行并入标题（仅第一条目）
                     if idx == 0:
@@ -436,6 +671,18 @@ class TOCProcessor:
                             prev_chars, _ = self._para_chars_text(prev)
                             result.pop()
                             title_chars = prev_chars + title_chars
+                        # 横向分割标题：合并同一行的左邻残片（如 "2 Mechanical Ou" + "tline"）
+                        if title_chars and result:
+                            prev = result[-1]
+                            first = title_chars[0]
+                            entry_title_x = self._char_box(first).x
+                            entry_y = self._char_box(first).y
+                            merged, did_merge = self._merge_left_title_fragment(
+                                prev, title_chars, entry_title_x, entry_y
+                            )
+                            if did_merge:
+                                title_chars = merged
+                                result.pop()
 
                     if header_chars:
                         result.append(self._build_paragraph(header_chars, para, None))
