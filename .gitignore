@@ -50,3 +50,6 @@ temp.jpg
 .codex
 .repomap.tags.cache.v1/
 
+# 本地排查记忆文件（仅本地记录，不提交）
+MEMORY_TOC_ISSUE.md
+
