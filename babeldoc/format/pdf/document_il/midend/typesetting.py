@@ -1510,7 +1510,7 @@ class Typesetting:
         all_units_fit = True
         last_unit: TypesettingUnit | None = None
         line_ys = [current_y]
-        if paragraph.first_line_indent:
+        if paragraph.first_line_indent and getattr(paragraph, "toc_role", None) != "title":
             current_x += space_width * 4
         # 遍历所有排版单元
         for i, unit in enumerate(typesetting_units):

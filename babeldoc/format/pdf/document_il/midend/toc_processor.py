@@ -510,13 +510,13 @@ class TOCProcessor:
         result: list[il_version_1.PdfParagraph],
         layout: il_version_1.PdfParagraph,
     ) -> list[il_version_1.PdfParagraph]:
-        """从 result 末尾向上收集与 layout 段同一行、x 相邻的标题残片段。
+        """扫描整个 result，收集与 layout 段同一行、x 相邻成链的标题残片段。
 
         layout 模型可能把章节目录条目拆成 [标题段1][标题段2][点线+页码段]
         （如 "Absolute Maxi" + "mum Ratings" + "......32"），标题与点线完全分离，
         无任何段落含完整"标题+点线+页码"，点线驱动无法识别。本方法以点线+页码
-        layout 段为锚点，收集其左侧同一行、x 无缝相邻、无点线/编号/页眉的
-        未配对残片段（从左到右返回列表），供调用者合并为标题。
+        layout 段为锚点，在整页 result 中寻找同行、从 layout 左缘向左 x 无缝相邻
+        （gap<=2pt）成链的未配对残片段，合并为标题。返回从左到右的碎片列表。
         """
         if layout.box is None:
             return []
@@ -524,36 +524,208 @@ class TOCProcessor:
         line_h = (lay_box.y2 or 0) - (lay_box.y or 0)
         if line_h <= 0:
             line_h = 10.0
+        # 收集与 layout 同一行、未配对、无点线/编号/页眉的候选段
+        candidates: list[il_version_1.PdfParagraph] = []
+        for pp in result:
+            if pp is layout:
+                continue
+            if pp.toc_role not in (None, "normal"):
+                continue
+            if pp.box is None:
+                continue
+            if abs((pp.box.y or 0) - (lay_box.y or 0)) > line_h:
+                continue
+            pp_chars, pp_text = self._para_chars_text(pp)
+            if not pp_chars:
+                continue
+            pp_stripped = pp_text.strip()
+            if not pp_stripped:
+                continue
+            if _LEADER_RUN.search(pp_text):
+                continue
+            if _NUMBER_RE.match(pp_stripped):
+                continue
+            if self._match_header_prefix(pp_stripped):
+                continue
+            candidates.append(pp)
+        if not candidates:
+            return []
+        # 从 layout 左缘向左构建 x 相邻链（每次取最靠右的相邻段，逐步左移）
         frags: list[il_version_1.PdfParagraph] = []
-        for prev in reversed(result):
-            if prev.box is None:
+        right_edge = lay_box.x or 0
+        while True:
+            best = None
+            best_x2 = -1.0
+            for pp in candidates:
+                if pp in frags:
+                    continue
+                x2 = pp.box.x2 or 0
+                if abs(x2 - right_edge) <= 2.0 and x2 > best_x2:
+                    best = pp
+                    best_x2 = x2
+            if best is None:
                 break
-            if prev.toc_role not in (None, "normal"):
-                break
-            prev_chars, prev_text = self._para_chars_text(prev)
-            if not prev_chars:
-                break
-            prev_stripped = prev_text.strip()
-            if not prev_stripped:
-                break
-            # 含点线 / 纯编号 / 页眉：非残片
-            if _LEADER_RUN.search(prev_text):
-                break
-            if _NUMBER_RE.match(prev_stripped):
-                break
-            if self._match_header_prefix(prev_stripped):
-                break
-            # 同行（y 差 < 行高）
-            prev_y = prev.box.y or 0
-            if abs(prev_y - (lay_box.y or 0)) > line_h:
-                break
-            # x 相邻：前段 x2 与 layout x 差 <= 2pt（无缝）
-            prev_x2 = prev.box.x2 or 0
-            if abs(prev_x2 - (lay_box.x or 0)) > 2.0:
-                break
-            frags.append(prev)
-        frags.reverse()
+            frags.append(best)
+            right_edge = best.box.x or 0
+        frags.sort(key=lambda pp: pp.box.x or 0)
         return frags
+
+    def _pair_orphan_layouts(self, result: list[il_version_1.PdfParagraph]) -> None:
+        """post-pass：把"孤立点线+页码"布局段与同一行 x 相邻的标题残片段配对。
+
+        主循环内处理时，标题残片段可能因 y 微差（如 0.2pt）排在点线段之后，
+        循环内看不到；这里在整个 result 上统一扫描，为每个未进入 _pairs 的
+        孤立 layout 段收集同行 x 相邻的残片段，合并为标题并配对。
+        已有配对的 title/layout 段、普通正文段、页眉、纯编号段不受影响。
+        """
+        if not result:
+            return
+        paired_layout = {id(lp) for _, lp in self._pairs}
+        orphans = [
+            pp
+            for pp in result
+            if pp.toc_role == "layout" and id(pp) not in paired_layout
+        ]
+        if not orphans:
+            return
+        remove_ids: set[int] = set()
+        new_pairs: list[tuple] = []
+        for lay in orphans:
+            frags = self._collect_orphan_title_fragment(result, lay)
+            if not frags:
+                continue
+            title_chars: list[il_version_1.PdfCharacter] = []
+            for frag in frags:
+                fc, _ = self._para_chars_text(frag)
+                title_chars.extend(fc)
+                remove_ids.add(id(frag))
+            title_chars = self._filter_title_outliers(title_chars)
+            if not title_chars:
+                continue
+            title_para = self._build_paragraph(title_chars, lay, "title")
+            new_pairs.append((title_para, lay))
+        if not new_pairs:
+            return
+        orphan_lays = {id(lay) for _, lay in new_pairs}
+        title_for = {id(lay): tp for tp, lay in new_pairs}
+        rebuilt: list[il_version_1.PdfParagraph] = []
+        for pp in result:
+            if id(pp) in remove_ids:
+                continue
+            if id(pp) in orphan_lays:
+                tp = title_for[id(pp)]
+                rebuilt.append(tp)
+                rebuilt.append(pp)
+                self._pairs.append((tp, pp))
+                continue
+            rebuilt.append(pp)
+        result[:] = rebuilt
+
+    def _merge_adjacent_titles(self, result: list[il_version_1.PdfParagraph]) -> None:
+        """合并同行、x 相邻（gap<=2pt）的两个已配对 title 段为一个条目。
+
+        layout 模型可能把章节目录标题横切成两个独立布局块（如第8章
+        "Absolute Maxi" + "mum Ratings"），TOCProcessor 把它们各自识别为
+        title+layout 条目。本方法把同行、x 无缝相邻的两个 title 段及其
+        layout 合并为单个条目，恢复完整标题。仅处理"同行且 x 相邻"的段，
+        图目录/表目录无此类情况，不会误合并。
+        """
+        if len(result) < 2 or not self._pairs:
+            return
+        title_to_layout = {id(tp): lp for tp, lp in self._pairs}
+        titles = [
+            (pp, pp.box)
+            for pp in result
+            if pp.toc_role == "title" and id(pp) in title_to_layout and pp.box is not None
+        ]
+        if len(titles) < 2:
+            return
+        # 按 y 分簇（同行）：y 差 <= 行高视为同一行。
+        # 不能按 (y,x) 全局排序后只查相邻——折行标题的两个碎片可能因 y 微差
+        # （如 "mum Ratings" 含离群字符 y 比 "Absolute Maxi" 小 2.4pt）排序颠倒，
+        # 导致 x 相邻判定失败。按 y 分簇后行内按 x 排序，保证 x 相邻配对正确。
+        from collections import Counter
+        hs = Counter(
+            round((b.y2 or 0) - (b.y or 0), 1)
+            for _, b in titles
+            if b.y is not None and b.y2 is not None
+        )
+        line_h = max(hs.items(), key=lambda kv: kv[1])[0] if hs else 12.0
+        if line_h <= 0:
+            line_h = 12.0
+        # y 分簇容差：用半个行高（而非整行高）。整行高会把相邻多行的 title 链式
+        # 并进同一簇（如物理21 line_h=14.6 把 y 579~607 全部并簇），导致簇内按 x 排序后
+        # 目标碎片（Absolute x=84 / mum x=159）被其他条目隔开，x 相邻判定失败。
+        # 用半行高（~7pt）：mum(593.4) 与 Absolute(595.82) 差 2.4 仍同簇，
+        # 但与相邻行（Electrical 579.4）差 14 被正确隔开。
+        cluster_tol = max(line_h * 0.5, 3.0)
+        titles.sort(key=lambda t: (t[1].y or 0))
+        clusters: list[list] = []
+        cur = [titles[0]]
+        for i in range(1, len(titles)):
+            if abs((titles[i][1].y or 0) - (titles[i - 1][1].y or 0)) <= cluster_tol:
+                cur.append(titles[i])
+            else:
+                clusters.append(cur)
+                cur = [titles[i]]
+        clusters.append(cur)
+        # 对每个同行簇，按 x 排序，找 x 相邻（gap<=2pt）的配对
+        pairs: list[tuple] = []
+        used: set[int] = set()
+        for cluster in clusters:
+            cluster.sort(key=lambda t: (t[1].x or 0))
+            for i in range(len(cluster) - 1):
+                t1, b1 = cluster[i]
+                t2, b2 = cluster[i + 1]
+                if id(t1) in used or id(t2) in used:
+                    continue
+                if abs((b2.x or 0) - (b1.x2 or 0)) > 2.0:
+                    continue
+                lp1 = title_to_layout.get(id(t1))
+                lp2 = title_to_layout.get(id(t2))
+                if lp1 is None or lp2 is None:
+                    continue
+                used.add(id(t1))
+                used.add(id(t2))
+                pairs.append((t1, t2, lp1, lp2))
+        if not pairs:
+            return
+        # 构造合并后的 title + layout
+        remove_ids = set()
+        new_entries = {}
+        for t1, t2, lp1, lp2 in pairs:
+            remove_ids.update((id(t1), id(t2), id(lp1), id(lp2)))
+            tchars: list[il_version_1.PdfCharacter] = []
+            for t in sorted([t1, t2], key=lambda x: (x.box.x or 0)):
+                tc, _ = self._para_chars_text(t)
+                tchars.extend(tc)
+            lchars: list[il_version_1.PdfCharacter] = []
+            for l in sorted([lp1, lp2], key=lambda x: (x.box.x or 0)):
+                lc, _ = self._para_chars_text(l)
+                lchars.extend(lc)
+            tchars = self._filter_title_outliers(tchars)
+            new_title = self._build_paragraph(tchars, t1, "title")
+            new_layout = self._build_paragraph(lchars, t1, "layout")
+            new_entries[id(t1)] = (new_title, new_layout)
+        # 重建 result：插入合并后的条目（优先），跳过被合并的段
+        rebuilt: list[il_version_1.PdfParagraph] = []
+        for pp in result:
+            if id(pp) in new_entries:
+                nt, nl = new_entries[id(pp)]
+                rebuilt.append(nt)
+                rebuilt.append(nl)
+                continue
+            if id(pp) in remove_ids:
+                continue
+            rebuilt.append(pp)
+        # 更新 _pairs：移除被合并的，追加新的
+        self._pairs = [
+            (tp, lp)
+            for tp, lp in self._pairs
+            if id(tp) not in remove_ids and id(lp) not in remove_ids
+        ]
+        self._pairs.extend(new_entries.values())
+        result[:] = rebuilt
 
     def _is_continuation_candidate(
         self,
@@ -718,6 +890,14 @@ class TOCProcessor:
             # 5) 其他（页眉、列标题 "Page" 等）：正常翻译
             result.append(para)
 
+        # 末尾 post-pass：
+        # 1) 孤立点线+页码布局段与同行 x 相邻的标题残片段配对
+        #    （标题残片可能因 y 微差排在点线段之后，循环内看不到，需整体扫描）
+        # 2) 同行、x 相邻的两个已配对 title 段合并为一个条目
+        #    （布局模型把章节目录标题横切成两个独立块，如第8章 Absolute Maximum Ratings）
+        self._pair_orphan_layouts(result)
+        self._merge_adjacent_titles(result)
+
         page.pdf_paragraph.clear()
         page.pdf_paragraph.extend(result)
         return True
@@ -751,6 +931,42 @@ class TOCProcessor:
                 top_line_bottom = max(ys)
                 title_para.box.y = top_line_bottom
                 title_para.box.y2 = top_line_bottom + line_h
+            # 修复 box.x：标题起始行（字符最多的 y 行簇）的 min x。
+            # 折行标题的续接行（如 "Coefficients" 折行的 "cients" x=108）y 靠上、
+            # x 靠左，会拉低 _compute_box 的 min x，使 box.x 定位到编号列（与章节号重合）。
+            # 这里把 box.x 提升到标题起始行的 min x，**不改变 y**（避免标题偏移）。
+            # 单行标题主簇即本身，box.x 不变；图/表目录 title（x=72）也不受影响。
+            from collections import Counter
+            yvals = [
+                round(self._char_box(c).y, 1)
+                for c in title_chars
+                if self._char_box(c).y is not None
+            ]
+            if yvals:
+                main_y = Counter(yvals).most_common(1)[0][0]
+                # 聚类容差用字符行高（众数），不能用 layout 段高度（异常大，如 36.3），
+                # 否则折行续接行也会被算进主簇，导致主簇 min x 被拉低、修复失效
+                hs = Counter(
+                    round(self._char_box(c).y2 - self._char_box(c).y, 1)
+                    for c in title_chars
+                    if self._char_box(c).y is not None
+                    and self._char_box(c).y2 is not None
+                )
+                char_h = max(hs.items(), key=lambda kv: kv[1])[0] if hs else 12.0
+                if char_h <= 0:
+                    char_h = 12.0
+                tol = char_h * 0.5
+                main_xs = [
+                    self._char_box(c).x
+                    for c in title_chars
+                    if self._char_box(c).y is not None
+                    and abs(round(self._char_box(c).y, 1) - main_y) < tol
+                    and self._char_box(c).x is not None
+                ]
+                if main_xs:
+                    main_x = min(main_xs)
+                    if title_para.box.x < main_x - 2:
+                        title_para.box.x = main_x
             # 单行标题：保持原文 y 坐标不变，不强制对齐布局段
             # （标题段和布局段在原文中本就同行，y 坐标相同，
             #   强制覆盖 layout_para.box.y 可能导致不同条目标题重叠）
