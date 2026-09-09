@@ -904,4 +904,37 @@
 - **验证**: NB25036-MRCD02_Spec.pdf（421 页）完整翻译通过，不再报错。
 - **上游价值**: 属上游普适缺陷（幽灵/纯译文段 xobj_id 缺失），可考虑提 PR。
 
+## 38. 目录页 TOC 增强：孤立 layout 配对 + 相邻 title 合并 + 折行标题 box.x/译文缩进修复
+
+- **Commit**: `0d76b7e`（toc_processor.py + typesetting.py）
+- **症状**（NB25036-MRCD02_Spec 目录页全篇翻译 `-p 13-38 --debug`）：
+  1. 第8章 `Absolute Maximum Ratings` 译文被拆成"绝对最大值"+"母体评分"（标题横切碎片未合并）
+  2. 图/表目录标题重叠、长标题消失（孤立点线 layout 段与标题残片未配对）
+  3. 7.22.2~7.29.7 等折行标题译文比单行标题（7.22.1）靠右 2-3 字（首行缩进误判）
+- **根因**:
+  1. 布局模型把长标题横切成两个**同行 x 相邻**的独立布局块（如 `Absolute Maxi`+`mum Ratings`），
+     TOCProcessor 各自识别为 title+layout 条目；且 `mum Ratings` 含 y=593.4 离群字符，
+     使 y 比 `Absolute Maxi`(595.8) 小 2.4pt，按 (y,x) 全局排序后顺序颠倒、x 相邻判定失败。
+  2. 布局模型把标题与点线完全分离（无完整"标题+点线+页码"结构），点线驱动无法识别，
+     标题残片走普通翻译，点线段成为孤立 layout。
+  3. `paragraph_finder.py:166-176` 按"首字符 x - box.x > 1"判 `first_line_indent`，
+     折行标题 box.x 被续接字符（`cients` x=108）拉低而首字符 x=144，差 36>1 误判 True，
+     触发 typesetting 首行缩进 4 空格。
+- **修复**:
+  - `toc_processor.py`：
+    - 新增 `_pair_orphan_layouts`（末尾 post-pass）：为"未进入 _pairs 的孤立点线 layout 段"
+      收集同行、从 layout 左缘向左 x 相邻成链的未配对残片段，合并为 title 并配对。
+      并把 `_DOTS_PAGE_RE` 判断移到 `_NUMBER_RE` 之前（否则 "......32" 被当纯编号截走）。
+    - 新增 `_merge_adjacent_titles`：按 **y 分簇**（容差半行高 `max(line_h*0.5,3.0)`，避免
+      整行高把相邻多行链式并簇）+ 簇内按 **x 排序**，合并同行 x 相邻（gap<=2pt）的两个
+      已配对 title 段及其 layout 为单条目。修复第8章 `Absolute Maximum Ratings`。
+    - `normalize_boxes`：新增**安全 box.x 修复**——把 title 段 box.x 提升到"字符最多的
+      y 行簇（标题起始行）"的 min x，**不改变 y**（避免标题偏移）。修复折行标题 box.x
+      被续接字符拉低到编号列导致与章节号重合。聚类容差用字符行高（不能用 layout 高度）。
+  - `typesetting.py` `_layout_typesetting_units`：对 `toc_role=="title"` 段**跳过
+    first_line_indent 首行缩进**（目录标题应顶格），修复折行标题译文偏移。
+- **验证**: 用户重跑 `-p 13-38 --debug` 确认：第8章合并为单个标题、译文与 7.22.1 对齐、
+  11.1.8 字体/标题下偏/标题过长重合全部正常。自测：图目录/表目录/JESD238B 均 0 误合并。
+- **上游价值**: 属上游普适缺陷（布局模型目录碎片化：横切标题/标题与点线分离），可考虑提 PR。
+
 
