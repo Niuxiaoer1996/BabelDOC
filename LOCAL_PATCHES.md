@@ -969,4 +969,31 @@
   下一行开头，与英文原文一致），无需修复。
 - **上游价值**: 属上游普适缺陷（布局模型把跨行条目页码残片并进段首、章节条目点线缺失），可考虑提 PR。
 
+## 40. 目录尾页单条点线误退出 + 下划线判公式误判
+
+- **Commit**: `toc_processor.py` + `styles_and_formulas.py`
+- **症状**（NB25036-MRCD02_Spec）：
+  1. **Page cxliv（表目录尾页）**：只有最后一条目录标签（`Table 332: ... 402`）时，页码没在
+     点线后原本位置（点线丢失、页码挤在标题后不右对齐）。
+  2. **`ALERT_n` → `ALERT{n}`**：下划线 `_` 被误判为公式占位符，LLM 改写后回填失败。
+- **根因**:
+  1. **目录尾页单条点线被误判为目录结束**：目录尾页只剩最后一条点线条目（T332）时，
+     `_count_dotted_lines=1 < _TOC_MIN_DOTTED_LINES(3)`，toc_processor 在 `process` 提前
+     return False 退出目录模式，T332 未拆分，点线/页码未保留。
+  2. **下划线 `_` 判公式**：下划线视觉框是字符框底部的细线（y 方向天然不一致，
+     `char.box.y > visual_bbox.box.y2`），命中 styles_and_formulas.py box 一致性检查
+     （"视觉框和实际框不一致"）被判为公式，生成 `{vN}` 占位符。
+- **修复**:
+  - `toc_processor.py`：
+    - `is_toc_page`：目录续页（prev_in_toc）时点线数门槛从 `_TOC_MIN_DOTTED_LINES(3)` 降到 `1`，
+      只要还有 >= 1 条点线即视为目录续页（尾页最后一条）。
+    - `process` 主循环：`dotted_lines == 0` 才退出目录模式（原 `<3` 就退出）。
+  - `styles_and_formulas.py`：box 一致性检查排除下划线 `_`（`char.char_unicode != "_"`）。
+- **验证**: 用户重跑确认 Page cxliv 的 T332 页码 402 与点线同框、右对齐正常（原文 402 被 layout
+  横切成 `40`+`2` 两框，译文保持同框结构，视觉对齐，无需额外处理）；`ALERT_n` 显示正常、目录
+  其他地方正常、无新问题。子集自测：p37 processed=True(title1+layout1)、p29 正确退出、p24-36 无回归；
+  `_` is_formula True→False。
+- **上游价值**: 目录尾页单条点线误判 + 下划线判公式误判均属上游普适缺陷，可考虑提 PR。
+
+
 

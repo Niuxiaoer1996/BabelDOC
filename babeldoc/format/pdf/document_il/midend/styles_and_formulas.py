@@ -460,10 +460,16 @@ class StylesAndFormulas:
                 )
                 or (
                     # 如果字符的视觉框和实际框不一致，则认为是公式字符
-                    char.box.x > char.visual_bbox.box.x2
-                    or char.box.x2 < char.visual_bbox.box.x
-                    or char.box.y > char.visual_bbox.box.y2
-                    or char.box.y2 < char.visual_bbox.box.y
+                    # 下划线 _ 除外：其视觉框是字符框底部的细线（y 方向天然不一致，
+                    # 如 ALERT_n 的下划线），并非公式特征，避免被误判为公式占位符
+                    # 后 LLM 改写为 {n} 导致回填失败。
+                    char.char_unicode != "_"
+                    and (
+                        char.box.x > char.visual_bbox.box.x2
+                        or char.box.x2 < char.visual_bbox.box.x
+                        or char.box.y > char.visual_bbox.box.y2
+                        or char.box.y2 < char.visual_bbox.box.y
+                    )
                 )
             )
 

@@ -199,12 +199,17 @@ class TOCProcessor:
           点线行数 >= _TOC_MIN_DOTTED_LINES 时判定为目录页。
         - 点线行数 < _TOC_MIN_DOTTED_LINES 的页不可能是目录页（含目录尾页之后
           的正文过渡页）。
+        - 目录续页（prev_in_toc）：目录尾页可能只剩最后一条点线条目（如
+          NB25036 表目录尾页单条 "Table N ... 页码"），点线行数 < 阈值但仍
+          需处理。此时只要仍有 >= 1 条点线（dotted_lines == 0 才真正结束）
+          即视为目录续页，否则最后一条条目的点线/页码不会被拆分保留。
         """
         if not page.pdf_paragraph:
             return False
         if dotted_lines is None:
             dotted_lines = self._count_dotted_lines(page)
-        if dotted_lines < _TOC_MIN_DOTTED_LINES:
+        min_dots = _TOC_MIN_DOTTED_LINES if not prev_in_toc else 1
+        if dotted_lines < min_dots:
             return False
         text_parts: list[str] = []
         for para in page.pdf_paragraph:
@@ -836,7 +841,7 @@ class TOCProcessor:
         dotted_lines = self._count_dotted_lines(page)
         if self._toc_state is not None:
             prev_in_toc = bool(self._toc_state.get("in_toc", False))
-            if dotted_lines < _TOC_MIN_DOTTED_LINES:
+            if dotted_lines == 0:
                 # 目录结束（进入正文过渡页），退出目录模式
                 if prev_in_toc:
                     self._toc_state["in_toc"] = False
