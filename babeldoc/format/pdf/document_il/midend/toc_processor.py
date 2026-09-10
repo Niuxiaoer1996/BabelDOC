@@ -47,6 +47,10 @@ _LEADER_RUN = re.compile(r"[" + _LEADER_CHARS + r"]{3,}")
 # 宽松点线：2+ 连续点。layout 模型可能把合并块最后一个条目的点线截短成 2 个点
 # （如 "Figure 167: ... Push-Pull .."），故条目边界用 2 点即可识别。
 _LEADER_RUN_LOOSE = re.compile(r"[" + _LEADER_CHARS + r"]{2,}")
+# 页码紧贴章节号的边界（布局模型缺失点线时，如 "...Word3187.29.3 ..."）。
+# 匹配 "页码(318) + 紧贴章节号(7.29.3)"：318 是上一条目页码，7.29.3 是新条目。
+# 页码要求至少 2 位且前面非点号/数字，避免误伤章节号自身（如 "7.29.1" 的 7）。
+_ATTACHED_SEC_RE = re.compile(r"(?<![.\d])\d{2,}(?=\d+\.\d+(?:\.\d+)*\s)")
 
 # 完整目录条目：标题 + 3+ 点引导线 + 页码（匹配前先 strip，坐标用 lead 偏移换算）
 _ENTRY_RE = re.compile(
@@ -56,6 +60,9 @@ _ENTRY_RE = re.compile(
 )
 # 行内数字编号前缀："6.2.1.1 Internal DBIac..."（编号后跟空格）
 _INLINE_NUM_RE = re.compile(r"^(?P<num>[\d.]+)\s+(?P<title>.+)$")
+# 段首裸整数紧贴标题（layout 模型把上一行跨行条目的页码残片并进本段段首且无空格，
+# 如 "313Table 257:...cients....314" 中的 "313"）。剥离整数，标题从 Table 开始。
+_INLINE_ATTACHED_NUM_RE = re.compile(r"^\d+(?=[^\d.\s])")
 # 行内文字编号前缀："Table 1 – ..." / "Figure 46 – ..."
 _INLINE_WORD_NUM_RE = re.compile(
     r"^(?P<num>(?:Table|FIGURE|TABLE|Figure)\s*\d+)\s*[-\u2013\u2014:.\t]\s*(?P<title>.+)$"
@@ -311,7 +318,7 @@ class TOCProcessor:
         )
         return para
 
-    def _iter_entry_spans(self, text: str):
+    def _iter_entry_spans(self, text: str, chars: list | None = None):
         """从左到右扫描文本，产出每个目录条目的
         (title_s, title_e, leader_s, leader_e, page_s, page_e) 绝对下标
         （page_s/page_e 为 None 表示无页码）。
@@ -331,11 +338,45 @@ class TOCProcessor:
             first = tokens[0]
             leading_page = re.search(r"(\d+)\s*$", text[:first])
             if leading_page is not None:
-                # 前移结构：页码在标题前，按 Figure/Table 边界切分
-                yield from self._iter_entry_spans_shifted(text, tokens)
-                return
-        # 常规结构（章节块 / JESD / 单条目）：点线驱动切分
+                # 前移结构：页码位于标题之前，[page][Figure N: title][dots]...
+                # 但 layout 模型可能把上一行条目（跨行）的页码残片并进本段段首
+                # （如 "313Table 257:...cients....314"，313 是上一行 Table 256
+                #  的页码，y 坐标不同行）。此时不是真正的前移结构，必须按点线
+                # 结构解析，否则点线后的真实页码（314）会丢失。用字符 y 坐标
+                # 验证段首数字与标题是否同一行。
+                if self._leading_page_same_line(chars, text, leading_page, first):
+                    # 前移结构：页码在标题前，按 Figure/Table 边界拆分
+                    yield from self._iter_entry_spans_shifted(text, tokens)
+                    return
+        # 点线结构：章节目录 / JESD / 表目录（页码在点线后）
         yield from self._iter_entry_spans_dotted(text)
+
+    def _leading_page_same_line(
+        self,
+        chars: list,
+        text: str,
+        leading_page: re.Match,
+        title_start: int,
+    ) -> bool:
+        """判断段首数字（leading_page）与标题是否同一行。
+
+        chars 与 text 一一对应（chars 拼接成 text）。若段首数字与标题首字符
+        的 y 坐标差异超过半行高，说明该数字是上一行的页码残片（不同行），
+        不是真正的前移结构页码。chars 为空时退化返回 True（沿用原逻辑）。
+        """
+        if not chars or title_start >= len(chars):
+            return True
+        lp_start = leading_page.start(1)
+        lp_end = leading_page.end()
+        if lp_end > len(chars) or lp_start >= len(chars):
+            return True
+        page_y = self._char_box(chars[lp_start]).y
+        title_y = self._char_box(chars[title_start]).y
+        title_box = self._char_box(chars[title_start])
+        line_h = (title_box.y2 or title_y) - title_y
+        if line_h <= 0:
+            line_h = 10.0
+        return abs(page_y - title_y) <= line_h * 0.5
 
     def _iter_entry_spans_dotted(self, text: str):
         """点线驱动切分（常规结构，页码在点线后）。
@@ -347,6 +388,21 @@ class TOCProcessor:
         pos = 0
         while pos < n:
             lm = _LEADER_RUN_LOOSE.search(text, pos)
+            title_end = lm.start() if lm else n
+            # 形态C：点线缺失时，标题内混入"页码紧贴章节号"边界（如
+            # "Word3187.29.3 ..."：318 是上一条目页码，7.29.3 是新章节条目）。
+            # 优先按该边界切分，避免上一条目吞掉下一条目、页码错配。
+            if lm is not None:
+                am = _ATTACHED_SEC_RE.search(text, pos, title_end)
+            else:
+                am = _ATTACHED_SEC_RE.search(text, pos)
+            if am is not None:
+                page_s = am.start()
+                page_e = am.end()
+                # 当前 title 到页码前；页码归入当前条目；章节号开始新条目
+                yield (pos, page_s, page_s, page_s, page_s, page_e)
+                pos = am.end()
+                continue
             if not lm:
                 break
             title_s, title_e = pos, lm.start()
@@ -452,6 +508,11 @@ class TOCProcessor:
             if m3:  # 剥离所有数字编号（含带点编号如 6.5、6.7.1.1）
                 # 用 start("title") 跳过编号和中间空格，标题段从标题文字开始
                 inline_num_end = header_end + rest_lead + m3.start("title")
+            else:
+                # 段首裸整数紧贴标题（上一行跨行条目的页码残片并进段首，无空格）
+                m4 = _INLINE_ATTACHED_NUM_RE.match(rest_clean)
+                if m4:
+                    inline_num_end = header_end + rest_lead + m4.end()
 
         title_chars = chars[inline_num_end:title_e]
         # 布局段 = 点线 + 页码（页码在前移结构下位于标题之前，单独收集）
@@ -823,7 +884,7 @@ class TOCProcessor:
 
             # 3) 完整条目：标题 + 点线 + 页码（layout 模型可能把多条相邻条目
             #    合并进同一段落，逐条拆分）
-            spans = list(self._iter_entry_spans(text))
+            spans = list(self._iter_entry_spans(text, chars))
             if spans:
                 for idx, (title_s, title_e, leader_s, leader_e, page_s, page_e) in enumerate(spans):
                     title_chars, layout_chars, header_chars = self._split_entry(
