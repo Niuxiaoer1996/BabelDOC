@@ -995,5 +995,38 @@
   `_` is_formula True→False。
 - **上游价值**: 目录尾页单条点线误判 + 下划线判公式误判均属上游普适缺陷，可考虑提 PR。
 
+## 41. 公式/布局/角标/IfD 批量修复（2026-09-14，分支 fix/toc-formula-digits）
+
+- **Commit**: 未提交（本批改动，含多文件）
+- **症状（electronics-14-02682 + NB25036-MRCD02_Spec）**：
+  1. 公式符号/上下标被 LLM 丢弃后跑到段尾（µ→×、×→· 目标字体映射错误）
+  2. 布局①参数解释（where...）逐行被合并成一段；③译文字号过小/挤一行（Kikuchi 段被压扁）；
+    ⑥标题被横向切成两块（2.6 节标题）
+  3. MRCD02 目录长标题（图57/58、73/74）被误合并、页码 114/136 丢失
+  4. page37 表7 注释（1./2.）被合并成一段；page80 参数解释 `Adc` 的 `dc`、`P1`/`P2` 的 `1`/`2`
+     应渲染为下标却按正文大小
+  5. If D 段（`If DCA Scrambling...`）被横向拆成 `If D` + 正文，`If D` 成孤立框
+  6. 译文被 LLM 提前截断（`，其` 结尾）；图表标题分隔符（`—`/`–`）被 LLM 随意改写
+- **修复**:
+  - `styles_and_formulas.py`：`_CORNER_Y_RAISE_PT=2.0` y 偏移检测角标；跨 composition 传 `prev_char`
+    + `_cross_guard`（阈值=字符高度）修复 page80 角标；安全字符压制公式字体触发
+  - `il_translator.py`：`_recover_missing_formula_placeholders`（丢占位符按原文顺序插回"下一幸存
+    占位符"前）；`_convert_llm_subsup_to_placeholders`（`<sub>X</sub>` 映射回 `{vN}`）；图表标题分隔符
+    保护 `{vSEP}`（`_TOC_TITLE_SEP_RE`）
+  - `il_translator_llm_only.py`：`_is_truncated_translation` 截断检测 → fallback 重译
+  - `paragraph_finder.py`：`split_parameter_explanation_paragraphs`（布局①）；`split_ordered_list_paragraphs`
+    （page37 注释）；`merge_title_caption_and_table_fragments` 放宽（布局⑥）+ `is_fallback_prefix`（If D）
+  - `il_creater_active.py:1484` + `il_creater.py:1293`：Form/Image XObject `on_xobj_form` 的
+    `(x,y,w,h)` 解包改为 `(x,y,x2,y2)`（BBox 是 `[x0,y0,x1,y1]`）——修复布局③ Kikuchi 段被压扁
+  - `toc_processor.py`：长标题 `inner_tokens` 切分 + 尾部独立页码剥离（修复 114/136 丢失）
+- **验证**: 用户重跑确认——MRCD02 page47 If D 正常、page80 角标正常、无空白段；electronics 图9化学式
+  （提示词方案，Qwen 弱模型偶发翻译为已知限制）；截断防御与标题分隔符保护正常。
+- **已登记已知限制（接受）**：化学式翻译（Cu→铜）、公式占位符错位、目录页缩写展开、弱模型自身问题
+  （`39]` 重复等）。详见 PROGRESS_FORMULA.md §二十四。
+- **注意**: 化学式**程序化保护方案已完全回退**（曾引入空白段落回归），回到提示词方案。
+- **上游价值**: 布局①②③⑥、page80 角标、If D、Form XObject box 属上游普适缺陷，可考虑提 PR；
+  公式占位符恢复/截断防御/标题分隔符保护属弱模型鲁棒性增强。
+
+
 
 

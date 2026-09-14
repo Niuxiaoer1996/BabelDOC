@@ -58,6 +58,10 @@ PROMPT_TEMPLATE = Template(
 - Tags (e.g., <style>, <b>, <code>): keep them exactly the same.  
   *Translate tag-internal text except code blocks (<code>…</code>)*.
 - Placeholders: `{v1}`, `{name}`, `%s`, `%d`, `[[...]]`, `%%...%%` — keep exactly unchanged.
+- If an input item carries a `formula_placeholders_hint` field, it maps each formula
+  placeholder (e.g. `{v3}`) to its real content (e.g. `"Ω"`). Keep every such placeholder
+  EXACTLY and in its ORIGINAL position. Do NOT drop it, rename it, or replace it with its
+  content — otherwise the formula / unit symbol / subscript will be lost.
 - JSON keys or structure.
 
 $glossary_usage_rules_block
@@ -876,6 +880,18 @@ class ILTranslatorLLMOnly:
                             )
                             llm_translate_tracker.set_placeholder_full_match()
                             continue
+
+                    # 截断防御：LLM 偶发提前停止输出导致译文后半句缺失，检测到则走 fallback 重译
+                    if self._is_truncated_translation(translated_text):
+                        llm_translate_tracker.set_error_message(
+                            "Translation appears truncated, fallback to retry."
+                        )
+                        logger.warning(
+                            f"Translation appears truncated, fallback to retry. "
+                            f"paragraph id: {inputs[id_][2].debug_id}"
+                        )
+                        continue
+
                     # Apply the translation to the paragraph
                     self.il_translator.post_translate_paragraph(
                         inputs[id_][2],
@@ -1069,3 +1085,25 @@ class ILTranslatorLLMOnly:
         if llm_output.endswith("```"):
             llm_output = llm_output[:-3]
         return llm_output.strip()
+
+    # 译文截断检测：LLM 偶发在句中提前停止输出（如译文以"，其"、"而"等未完成
+    # 连接词/代词结尾，或直接以公式占位符结尾），导致后半句缺失。检测到后触发
+    # fallback 重译。用强截断信号（逗号+未完成词、占位符结尾）降低误伤正常句。
+    _TRUNC_END_RE = re.compile(
+        r"[\u3001，；：,;:]\s*(?:其|而|以|该|这种|这|它|它们|从而|使|将|并|且|但|"
+        r"因此|所以|以及|然后|对|从|与|及|或|因|为|若|如|当|由|被|让|把|给|"
+        r"时|后|前|中|内|上|下|中)\s*$"
+    )
+
+    def _is_truncated_translation(self, text: str) -> bool:
+        """检测译文是否被 LLM 提前截断（后半句缺失）。"""
+        if not text:
+            return False
+        plain = re.sub(r"<style[^>]*>|</style>", "", text).strip()
+        if not plain:
+            return False
+        # 以公式占位符结尾：占位符后无文字，正常译文不会这样结束（强信号）
+        if re.search(r"\{v\d+\}\s*$", plain):
+            return True
+        # 以"逗号/分号 + 未完成连接词/代词"结尾：后半句缺失（强信号）
+        return bool(self._TRUNC_END_RE.search(plain))

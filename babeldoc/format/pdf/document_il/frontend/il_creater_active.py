@@ -1481,8 +1481,10 @@ class ActiveILCreater:
         extra_passthrough_instruction: str | None = None,
     ):
         matrix = multiply_matrices(matrix, ctm)
-        (x, y, w, h) = guarded_bbox(bbox)
-        bounds = ((x, y), (x + w, y), (x, y + h), (x + w, y + h))
+        # bbox 是 Form/Image XObject 的 /BBox（[x0, y0, x1, y1]），不能当 (x, y, w, h) 解包，
+        # 否则 x1/y1 被误作宽高，box 被放大覆盖整页（导致正文避让图片时被压扁）。
+        (x, y, x2, y2) = guarded_bbox(bbox)
+        bounds = ((x, y), (x2, y), (x, y2), (x2, y2))
         bbox = get_bound(apply_matrix_pt(matrix, (p, q)) for (p, q) in bounds)
 
         gs = self.create_graphic_state(

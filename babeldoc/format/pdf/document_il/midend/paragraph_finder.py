@@ -298,6 +298,15 @@ class ParagraphFinder:
         # 合并为一个段落。LLM 翻译整段后逐行格式丢失。按 "NOTE N" 行拆分。
         self.split_note_paragraphs(paragraphs)
 
+        # 第三步 1/2：拆分"参数解释/逐行条目"段落（公式下方 where 后的参数解释，
+        # 每行一个参数）。版面模型常把这类多行合并成一个段落，LLM 翻译后合并成一行，
+        # 丢失"每行一个参数"的排版。按行拆成独立段落，使每行独立翻译。
+        self.split_parameter_explanation_paragraphs(paragraphs)
+
+        # 第三步 1/3：拆分"有序列表"段落（表格注记 "1. xxx"/"2. xxx" 等），
+        # 使每项独立翻译、保留逐项格式。
+        self.split_ordered_list_paragraphs(paragraphs)
+
         # 第三步 3/4：拆分"多个无序列表项被并成一行"的行
         # 行分组 threading 扫描对行距紧/字符 y 重叠的列表会把多个垂直
         # 排列的 bullet 项并成一行（"• A • B • C"），使行级列表项拆分失效。
@@ -580,6 +589,96 @@ class ParagraphFinder:
 
     _NOTE_START_RE = re.compile(r"^NOTE\s+\d+", re.IGNORECASE)
 
+    # 参数解释/逐行条目的识别：
+    # 公式下方常出现 "where" 后的参数解释，每行一个参数（如
+    #   CL : Effective load capacitance,
+    #   V : Supply voltage,
+    #   f : Clock frequency,
+    #   RI/O : I/O path resistance.
+    # 这类"每行一个条目"的多行段落被版面模型合并成一个段落，LLM 翻译后合并成一行，
+    # 丢失逐行排版。识别特征：每行是"短变量符号 : 描述"模式，冒号前是非英文关键词的
+    # 短符号（CL/V/f/E/∆α/∆T 等），且不是 Received/Revised 等英文关键词行。
+    # 希腊字母/数学符号范围：U+0370-03FF（α β γ ...）、U+2206（∆）、U+03BC（µ）、
+    # U+00B0（°）、U+2212（−）等。
+    _PARAM_SYMBOL_CHARS = r"A-Za-z0-9_\u0370-\u03ff\u2206\u03bc\u00b0\u2212\u00b1/\u00b7\u00d7"
+    _PARAM_ENTRY_RE = re.compile(
+        rf"^([{_PARAM_SYMBOL_CHARS}]+)\s*[:：]\s+.+"
+    )
+    # 冒号前是纯英文单词（>=4 字母，如 Received/Revised/Accepted/Published）时不视为
+    # 参数符号（这些是日期/版权等元信息行，不应拆分）。
+    _PARAM_ENGLISH_WORD_RE = re.compile(r"^[A-Za-z]{4,}$")
+
+    def _is_parameter_entry_line(self, line_text: str) -> bool:
+        """判断一行是否为"短变量符号 : 描述"的参数条目。"""
+        if not line_text:
+            return False
+        m = self._PARAM_ENTRY_RE.match(line_text)
+        if not m:
+            return False
+        sym = m.group(1).strip()
+        if not sym:
+            return False
+        # 含希腊字母/数学符号/数字/斜杠 -> 肯定是变量符号
+        if re.search(r"[\u0370-\u03ff\u2206\u03bc\u00b0\u2212\u00b1/\u00b7\u00d70-9_]", sym):
+            return True
+        # 纯字母：<=3 视为变量符号（CL/V/f/E）；>=4 视为英文关键词（Received），排除
+        if re.match(r"^[A-Za-z]+$", sym):
+            return len(sym) <= 3
+        return False
+
+    def split_parameter_explanation_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """拆分"参数解释/逐行条目"段落，使每行参数独立成段、独立翻译。
+
+        公式下方 "where" 后的参数解释常被版面模型合并成一个多行段落，LLM 翻译整段后
+        合并成一行，丢失"每行一个参数"的排版（见 electronics 第2/21页）。本函数把
+        每个参数条目行拆成独立段落，使 LLM 对每行独立翻译、保留逐行格式。
+        """
+        new_paragraphs = []
+        for paragraph in paragraphs:
+            comps = paragraph.pdf_paragraph_composition
+            if not comps or len(comps) < 2:
+                new_paragraphs.append(paragraph)
+                continue
+
+            # 获取每行文本（仅 pdf_line 类型；非行 composition 视为不可拆）
+            line_texts = []
+            all_line = True
+            for comp in comps:
+                if comp.pdf_line:
+                    text = get_char_unicode_string(
+                        comp.pdf_line.pdf_character
+                    ).strip()
+                    line_texts.append(text)
+                else:
+                    line_texts.append(None)
+                    all_line = False
+            if not all_line:
+                new_paragraphs.append(paragraph)
+                continue
+
+            # 每行都必须是参数条目，才认为是参数解释段落
+            if not all(
+                self._is_parameter_entry_line(t) for t in line_texts
+            ):
+                new_paragraphs.append(paragraph)
+                continue
+
+            logger.info(
+                f"Splitting parameter-explanation paragraph {paragraph.debug_id} "
+                f"into {len(comps)} paragraphs"
+            )
+            for comp in comps:
+                sub_para = self._create_split_paragraph(paragraph, [comp])
+                if sub_para:
+                    # 标记为"参数解释行"，使后续 merge（如 merge_mid_sentence_
+                    # continuation_paragraphs）跳过，避免把拆开的参数行（如
+                    # "CL : ...," + "V : ..."）因"逗号结尾 + 字母开头续接"重新合并。
+                    sub_para.is_parameter_explanation_line = True
+                    new_paragraphs.append(sub_para)
+
+        paragraphs.clear()
+        paragraphs.extend(new_paragraphs)
+
     def split_note_paragraphs(self, paragraphs: list[PdfParagraph]):
         """拆分包含多个 "NOTE N" 条目的段落。
 
@@ -645,6 +744,80 @@ class ParagraphFinder:
                 )
                 if note_para:
                     new_paragraphs.append(note_para)
+
+        paragraphs.clear()
+        paragraphs.extend(new_paragraphs)
+
+    def split_ordered_list_paragraphs(self, paragraphs: list[PdfParagraph]):
+        """拆分"有序列表"段落（如表格注记 "1. xxx" / "2. xxx"），使每项独立成段。
+
+        表格注记/脚注常含多个有序列表项（"1. ..."、"2. ..."），被版面模型合并成一个
+        多行段落，LLM 翻译整段后合并成一段，丢失逐项格式。按有序列表项起点（1./2./a)）
+        拆分成独立段落，每项独立翻译、保留原始行格式。
+        """
+        new_paragraphs = []
+        for paragraph in paragraphs:
+            comps = paragraph.pdf_paragraph_composition
+            if not comps or len(comps) < 2:
+                new_paragraphs.append(paragraph)
+                continue
+
+            # 获取每行文本（仅 pdf_line 类型）
+            line_texts = []
+            all_line = True
+            for comp in comps:
+                if comp.pdf_line:
+                    line_texts.append(
+                        get_char_unicode_string(comp.pdf_line.pdf_character).strip()
+                    )
+                else:
+                    line_texts.append(None)
+                    all_line = False
+            if not all_line:
+                new_paragraphs.append(paragraph)
+                continue
+
+            # 找到所有有序列表项起点行（"1."/"2."/a)/b) 等）。
+            # 表格注记/脚注（table_footnote）用宽松匹配（"1.CA13" 数字+句点无空格）。
+            is_footnote = (paragraph.layout_label or "") == "table_footnote"
+            item_indices = [
+                i
+                for i, t in enumerate(line_texts)
+                if t
+                and (
+                    self._FOOTNOTE_ITEM_RE.match(t)
+                    if is_footnote
+                    else self._ORDERED_LIST_ITEM_RE.match(t)
+                )
+            ]
+            # 列表项不足 2 个，不需要拆分
+            if len(item_indices) <= 1:
+                new_paragraphs.append(paragraph)
+                continue
+
+            logger.info(
+                f"Splitting ordered-list paragraph {paragraph.debug_id} into "
+                f"{len(item_indices)} items"
+            )
+
+            # 列表项之前的行（如果有）作为独立段落
+            first_idx = item_indices[0]
+            if first_idx > 0:
+                pre_para = self._create_split_paragraph(paragraph, comps[:first_idx])
+                if pre_para:
+                    new_paragraphs.append(pre_para)
+
+            # 按列表项起点拆分，每组从列表项到下一个列表项之前
+            for gi, start_idx in enumerate(item_indices):
+                end_idx = (
+                    item_indices[gi + 1]
+                    if gi + 1 < len(item_indices)
+                    else len(comps)
+                )
+                group_comps = comps[start_idx:end_idx]
+                item_para = self._create_split_paragraph(paragraph, group_comps)
+                if item_para:
+                    new_paragraphs.append(item_para)
 
         paragraphs.clear()
         paragraphs.extend(new_paragraphs)
@@ -1046,21 +1219,31 @@ class ParagraphFinder:
                 if abs(a_cy - b_cy) > 4.0:  # 同一行
                     continue
                 h_gap = b.box.x - a.box.x2  # b 紧贴 a 右侧
-                if not (-0.5 <= h_gap <= 4.0):
-                    continue
                 first_ch = self._paragraph_first_char(b)
                 if not first_ch:
                     continue
                 a_label = a.layout_label or ""
                 b_label = b.layout_label or ""
                 is_lower_cont = first_ch.islower()
+                # 标题类片段对（title/table_caption/figure_caption/fallback_line）：
+                # 长标题横切处 box 常轻微重叠 1-2pt（如 "2.6. Research...T" + "echnology"），
+                # 且续接片段可能以 "." 开头（如 "3" + ".3.1. Importance..."）。对标题对
+                # 放宽 h_gap 下限与首字符限制，避免标题被切块。
                 is_title_pair = (
                     a_label in title_like
                     and b_label in title_like
-                    and first_ch.isalpha()
+                    and (first_ch.isalpha() or first_ch == ".")
                     and len((a.unicode or "")) <= 60
                     and len((b.unicode or "")) <= 80
                 )
+                if is_title_pair:
+                    # 标题对允许轻微 x 重叠（h_gap 到 -2.0）
+                    if not (-2.0 <= h_gap <= 4.0):
+                        continue
+                else:
+                    # 普通续接要求不重叠（-0.5 起）
+                    if not (-0.5 <= h_gap <= 4.0):
+                        continue
                 # 下标/上标续接：b 与 a 同行紧贴且 b 行高明显小于 a
                 # （如 "t" + 下标 "INIT2" 被版面切成两个水平片段）。
                 # b 是 a 行末词的下标部分，必须并回 a，否则独立段渲染
@@ -1073,7 +1256,22 @@ class ParagraphFinder:
                     and h_b
                     and h_b < h_a * 0.75
                 )
-                if not (is_lower_cont or is_title_pair or is_subscript_cont):
+                # fallback_line 短前缀 + 相邻 plain text：版面模型把一句话的句首
+                # （如 "If DCA Scrambling..." 的 "If D"）切成 fallback_line 短片段，
+                # 后续正文为 plain text。若不合并，该短片段独立翻译/直出会残留英文
+                # 或渲染成孤立框。此处把 fallback_line 前缀并回右侧 plain text。
+                is_fallback_prefix = bool(
+                    a_label == "fallback_line"
+                    and b_label == "plain text"
+                    and len((a.unicode or "")) <= 15
+                    and len((b.unicode or "")) <= 300
+                )
+                if not (
+                    is_lower_cont
+                    or is_title_pair
+                    or is_subscript_cont
+                    or is_fallback_prefix
+                ):
                     continue
                 if abs(h_gap) < best_gap:
                     best_j, best_gap = j, abs(h_gap)
@@ -1179,7 +1377,13 @@ class ParagraphFinder:
             # 表格区段落不参与"句中续接"合并：表格单元格行本应每行独立，
             # 若被误并成一段，译文流式重排会挤压到表格顶部，丢失行对齐。
             # 参考文献条目（skip_translate）也不参与合并。
-            if getattr(a, "in_table_layout", False) or getattr(a, "skip_translate", False):
+            # 参数解释行（拆分自 split_parameter_explanation_paragraphs）保持独立，
+            # 不参与合并（每行一个参数，见 is_parameter_explanation_line）。
+            if (
+                getattr(a, "in_table_layout", False)
+                or getattr(a, "skip_translate", False)
+                or getattr(a, "is_parameter_explanation_line", False)
+            ):
                 i += 1
                 continue
             merged = False
@@ -1205,6 +1409,7 @@ class ParagraphFinder:
                             b.box is None
                             or getattr(b, "in_table_layout", False)
                             or getattr(b, "skip_translate", False)
+                            or getattr(b, "is_parameter_explanation_line", False)
                             or a.xobj_id != b.xobj_id
                             or (a.layout_label or "") != (b.layout_label or "")
                             or self._paragraph_is_list_item_start(b)
@@ -1705,6 +1910,9 @@ class ParagraphFinder:
     _ORDERED_LIST_ITEM_RE = re.compile(
         r"^(?:\d+|[a-zA-Z])\s*[.、)）]\s+"
     )
+    # 表格注记/脚注的有序列表项：如 "1.CA13..."、"2.MRCD..."（数字+句点，允许无空格）。
+    # 用于 split_ordered_list_paragraphs 识别 table_footnote 里的列表项起点。
+    _FOOTNOTE_ITEM_RE = re.compile(r"^\d+\.")
 
     # 句中续接连词：段落以这些词结尾（无句末标点）时，视为明显的句中切分，
     # 允许下一段以大写字母开头续接合并（正常完整句子不会以连词结尾）。

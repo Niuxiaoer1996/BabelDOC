@@ -1235,6 +1235,12 @@ class PdfParagraph:
     skip_translate: bool = field(
         default=False,
     )
+    # 参数解释行标记：由 split_parameter_explanation_paragraphs 拆分的参数条目行
+    # （如公式下方 where 后 "CL : ..." 每行一个参数）为 True，保持每行独立成段，
+    # 跳过"句中续接"合并，避免拆开的参数行被重新合并（运行时标记，不参与序列化）。
+    is_parameter_explanation_line: bool = field(
+        default=False,
+    )
     debug_id: str | None = field(
         default=None,
         metadata={

@@ -45,6 +45,16 @@ _BULLET_FOR_FORMULA_EXCLUSION = re.compile(
     r"\u204e\u205c\u2767\u2619\u204b"
     r"\uf09e\uf09f\uf0a7\uf0b7\uf0d8\uf0e0]"
 )
+# 普通文本里的"字面符号"：数字、加号、方括号、等号。它们在正文/目录里是普通文本
+# （如 X16+ X13+... 的 16/+、[35,36] 的方括号、RW01[4] 的 [4]、PG70RW60[7] = 0 的 =），
+# 不应被判成公式占位符 {vN}。若判成占位符，弱模型改写/丢弃后内容会被追到段尾或丢格式。
+# 注意：仅限 ASCII 基础符号——× · − < > ~ ± µ ° 等符号在目标 CJK 字体里可能被映射成
+# 错误字形（µ→×、×→·），必须仍按公式保留原字形，不进此列表。
+# 真实的上下标数字由 is_corner_mark 命中（字号更小/基线偏移），不受此压制影响。
+_PLAIN_INLINE_CHAR_RE = re.compile(r"[0-9+\]\[=]")
+# 上下标的基线 y 偏移阈值（pt）。同字号但抬高/降低的上下标（如 m⁻¹ 中的 ⁻，字号比
+# 0.79 临界漏判）用基线偏移识别。同一行普通文本 char.box.y 完全相同（0 偏移），故安全。
+_CORNER_Y_RAISE_PT = 2.0
 from babeldoc.format.pdf.document_il.utils.spatial_analyzer import (
     is_element_contained_in_formula,
 )
@@ -398,12 +408,19 @@ class StylesAndFormulas:
         max_y = max(char.visual_bbox.box.y2 for char in line.pdf_character)
         line.box = Box(min_x, min_y, max_x, max_y)
 
+    @staticmethod
+    def _is_plain_inline_char(char: str) -> bool:
+        if not char:
+            return False
+        return bool(_PLAIN_INLINE_CHAR_RE.match(char))
+
     def _classify_characters_in_composition(
         self,
         composition: PdfParagraphComposition,
         formula_font_ids: set[int],
         first_is_bullet_so_far: bool,
         line_index: int,
+        prev_char: PdfCharacter | None = None,
     ) -> tuple[list[tuple[PdfCharacter, bool]], bool]:
         """
         Phase 1: Classify every character in a composition as either formula or text.
@@ -432,27 +449,118 @@ class StylesAndFormulas:
             if not first_is_bullet and is_start_of_segment and is_bullet_point(char):
                 first_is_bullet = True
 
+            # line 首字符用上一 composition 的最后一个字符作参考（跨 composition 角标检测，
+            # 如 "Adc" 中 A 与 dc 被 layout 拆成不同 composition，dc 的基线/字号差异需与 A 比较）
+            is_cross_prev = i == 0 and prev_char is not None
+            previous_char = (
+                line.pdf_character[i - 1] if i > 0 else prev_char
+            )
+            next_char = (
+                line.pdf_character[i + 1] if i < len(line.pdf_character) - 1 else None
+            )
+            isspace = char.char_unicode.isspace() if char.char_unicode else False
+            prev_is_space = (
+                previous_char.char_unicode.isspace()
+                if previous_char and previous_char.char_unicode
+                else False
+            )
+
+            is_formula_start = is_formulas_start_char(
+                char.char_unicode,
+                self.font_mapper,
+                self.translation_config,
+            )
+            is_formula_middle = is_formulas_middle_char(
+                char.char_unicode,
+                self.font_mapper,
+                self.translation_config,
+            )
+
+            # 上下标（角标）判定：
+            # ① 字号明显更小（原逻辑，0.79/1.1 阈值区分角标与大写首字母）；
+            # ② 同字号但基线 y 明显抬高/降低（如 m⁻¹ 中的 ⁻，字号比 0.79 临界漏判，
+            #    用 char.box.y 与前一字符的基线偏移识别——同一行普通文本 box.y 完全相同）。
+            # 跨 composition 的 previous_char（line 首字符）须与当前字符**真正同行**，
+            # 否则上一行末尾字符会被误判为角标参考（如 B32i3 段，行间距约 14pt，
+            # 上一行末字符 y 与本行首字符 y 差 13.9，若阈值过宽会误判为角标）。
+            # 同行角标的 y 偏移（如 Adc 的 dc，2.5pt）远小于字符高度，跨行 y 差
+            # （约行高）大于字符高度，故用字符高度作阈值可区分。
+            _cross_guard = not is_cross_prev or (
+                previous_char is not None
+                and previous_char.box is not None
+                and char.box is not None
+                and abs(char.box.y - previous_char.box.y)
+                < (char.box.y2 - char.box.y)
+            )
+            is_corner_mark = _cross_guard and (
+                (
+                    previous_char is not None
+                    and not isspace
+                    and not prev_is_space
+                    and not first_is_bullet
+                    # 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
+                    and char.pdf_style.font_size
+                    < previous_char.pdf_style.font_size * 0.79
+                    and not in_corner_mark_state
+                )
+                or (
+                    previous_char is not None
+                    and not isspace
+                    and not prev_is_space
+                    and char.pdf_style.font_size
+                    < previous_char.pdf_style.font_size * 1.1
+                    and in_corner_mark_state
+                )
+                or (
+                    # 检查段落开始的角标：当没有前一个字符时，通过下一个字符判断
+                    previous_char is None
+                    and next_char is not None
+                    and not isspace
+                    and not prev_is_space
+                    and not first_is_bullet
+                    # 当前字符字体大小明显小于下一个字符，判定为角标
+                    and char.pdf_style.font_size < next_char.pdf_style.font_size * 0.79
+                    and not in_corner_mark_state
+                )
+                or (
+                    # 基线 y 偏移：相对前一字符基线明显抬高（上标）或降低（下标）。
+                    # 仅作为"角标起始"触发（not in_corner_mark_state），避免从角标回落到
+                    # 正文基线的字符（如 m⁻¹ 后面的 K）被误判为下标。
+                    # 注：此判定不受 first_is_bullet 抑制——bullet 列表项（如 "• Adc"）内
+                    # 的 Adc/P1/P2 下标是真实上下标（y 偏移是强信号），不应因以 bullet 开头
+                    # 而被误判为普通文本。字号角标起始判定仍受 first_is_bullet 抑制。
+                    previous_char is not None
+                    and previous_char.box is not None
+                    and char.box is not None
+                    and not isspace
+                    and not prev_is_space
+                    and not in_corner_mark_state
+                    and (
+                        char.box.y - previous_char.box.y > _CORNER_Y_RAISE_PT
+                        or previous_char.box.y - char.box.y > _CORNER_Y_RAISE_PT
+                    )
+                )
+            )
+
+            # 普通文本字面符号（数字/[ ]/=×·−<>~±µ° 等）压制：
+            # 若不是上下标、也不是公式对象（formula_layout_id），则当作普通文本，不生成 {vN}
+            # 占位符。修复 X16+ / [35,36] / RW01[4] / PG70RW60[7]=0 / W/m·K / µm / °C 等
+            # 被弱模型改写占位符后内容跑到段尾或丢失的问题。
+            # µ/° 在 LaTeX PDF 里常落在数学字体(CMSY10/EURM10)，故此处对安全字符一并压制
+            # 公式字体的触发。
+            is_in_formula_font = char.pdf_style.font_id in formula_font_ids
+            if self._is_plain_inline_char(char.char_unicode) and not is_corner_mark:
+                is_formula_start = False
+                is_formula_middle = False
+                is_in_formula_font = False
+
             is_formula = (
                 (  # 区分公式开头的字符&公式中间的字符。主要是逗号不能在公式开头，但是可以在中间。
                     char.formula_layout_id
-                    or (
-                        is_formulas_start_char(
-                            char.char_unicode,
-                            self.font_mapper,
-                            self.translation_config,
-                        )
-                        and not in_formula_state
-                    )
-                    or (
-                        is_formulas_middle_char(
-                            char.char_unicode,
-                            self.font_mapper,
-                            self.translation_config,
-                        )
-                        and in_formula_state
-                    )
+                    or (is_formula_start and not in_formula_state)
+                    or (is_formula_middle and in_formula_state)
                 )  # 公式字符
-                or char.pdf_style.font_id in formula_font_ids  # 公式字体
+                or is_in_formula_font  # 公式字体
                 or char.vertical  # 垂直字体
                 or (
                     #   如果是程序添加的 dummy 空格
@@ -470,51 +578,6 @@ class StylesAndFormulas:
                         or char.box.y > char.visual_bbox.box.y2
                         or char.box.y2 < char.visual_bbox.box.y
                     )
-                )
-            )
-
-            previous_char = line.pdf_character[i - 1] if i > 0 else None
-            next_char = (
-                line.pdf_character[i + 1] if i < len(line.pdf_character) - 1 else None
-            )
-            isspace = char.char_unicode.isspace() if char.char_unicode else False
-            prev_is_space = (
-                previous_char.char_unicode.isspace()
-                if previous_char and previous_char.char_unicode
-                else False
-            )
-
-            is_corner_mark = (
-                (
-                    previous_char is not None
-                    and not isspace
-                    and not prev_is_space
-                    and not first_is_bullet
-                    # 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
-                    and char.pdf_style.font_size
-                    < previous_char.pdf_style.font_size * 0.79
-                    and not in_corner_mark_state
-                )
-                or (
-                    previous_char is not None
-                    and not isspace
-                    and not prev_is_space
-                    and not first_is_bullet
-                    # 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
-                    and char.pdf_style.font_size
-                    < previous_char.pdf_style.font_size * 1.1
-                    and in_corner_mark_state
-                )
-                or (
-                    # 检查段落开始的角标：当没有前一个字符时，通过下一个字符判断
-                    previous_char is None
-                    and next_char is not None
-                    and not isspace
-                    and not prev_is_space
-                    and not first_is_bullet
-                    # 当前字符字体大小明显小于下一个字符，判定为角标
-                    and char.pdf_style.font_size < next_char.pdf_style.font_size * 0.79
-                    and not in_corner_mark_state
                 )
             )
 
@@ -618,6 +681,9 @@ class StylesAndFormulas:
             new_paragraph_compositions = []
             # This flag is carried through all compositions in a paragraph, as in the original implementation.
             first_is_bullet = False
+            # 跨 composition 的角标检测参考：上一 composition 的最后一个字符
+            # （layout 模型可能把 "Adc" 拆成 A + dc 两个 composition，dc 需与 A 比较基线/字号）
+            prev_line_last_char: PdfCharacter | None = None
 
             for line_index, composition in enumerate(
                 paragraph.pdf_paragraph_composition
@@ -630,7 +696,11 @@ class StylesAndFormulas:
                     current_formula_font_ids,
                     first_is_bullet,
                     line_index,
+                    prev_line_last_char,
                 )
+                _prev_line = composition.pdf_line
+                if _prev_line and _prev_line.pdf_character:
+                    prev_line_last_char = _prev_line.pdf_character[-1]
 
                 if not tagged_chars:
                     new_paragraph_compositions.append(composition)

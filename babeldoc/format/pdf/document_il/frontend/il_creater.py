@@ -1290,8 +1290,9 @@ class ILCreater:
     ):
         logger.debug(f"on_xobj_form: {do_args}[{bbox}] @ {xref_id} in {self.xobj_id}")
         matrix = mult_matrix(matrix, ctm)
-        (x, y, w, h) = guarded_bbox(bbox)
-        bounds = ((x, y), (x + w, y), (x, y + h), (x + w, y + h))
+        # bbox 是 /BBox（[x0, y0, x1, y1]），不能当 (x, y, w, h) 解包，否则 box 被放大覆盖整页。
+        (x, y, x2, y2) = guarded_bbox(bbox)
+        bounds = ((x, y), (x2, y), (x, y2), (x2, y2))
         bbox = get_bound(apply_matrix_pt(matrix, (p, q)) for (p, q) in bounds)
 
         gs = self.create_graphic_state(

@@ -409,8 +409,37 @@ class TOCProcessor:
                 pos = am.end()
                 continue
             if not lm:
+                # 点线缺失：长标题占满整行、下一行直接是下一个图/表条目标题（无点线
+                # 页码分隔，如 "Figure 57: ... Frequency Change Figure 58: ..."）。
+                # 若当前及之后仍混入多个 Figure/Table 条目边界，按边界切分，
+                # 避免两个条目标题被合并成一个 title 段（页码错配/标题丢失）。
+                rest_tokens = [
+                    m.start() for m in _ENTRY_TOKEN_RE.finditer(text, pos)
+                ]
+                if len(rest_tokens) >= 2:
+                    for k, s in enumerate(rest_tokens):
+                        next_s = (
+                            rest_tokens[k + 1]
+                            if k + 1 < len(rest_tokens)
+                            else n
+                        )
+                        yield (s, next_s, next_s, next_s, None, None)
                 break
             title_s, title_e = pos, lm.start()
+            # title 内混入多个图/表条目（长标题占满整行、条目之间无点线分隔，如
+            # "Figure 73: ... 1N Figure 74: ... 1N Figure 75:..."，只有最后一条
+            # 有点线+页码）。按 Figure/Table 边界切分前几个无点线条目，最后一个
+            # 条目的点线在下次循环处理，避免两个条目标题被合并成一个 title 段。
+            inner_tokens = [
+                m.start()
+                for m in _ENTRY_TOKEN_RE.finditer(text, pos, title_e)
+            ]
+            if len(inner_tokens) >= 2:
+                for k, s in enumerate(inner_tokens[:-1]):
+                    next_s = inner_tokens[k + 1]
+                    yield (s, next_s, next_s, next_s, None, None)
+                pos = inner_tokens[-1]
+                continue
             leader_s, leader_e = lm.start(), lm.end()
             m2 = re.match(r"\s*(\d+)", text[leader_e:])
             if m2:
@@ -520,10 +549,36 @@ class TOCProcessor:
                     inline_num_end = header_end + rest_lead + m4.end()
 
         title_chars = chars[inline_num_end:title_e]
+        # 无点线页码时（inner_tokens 切出的长标题条目，如 "Figure 73: ... 1N136"），
+        # 标题尾部可能混入独立页码（无点线、物理在下一行，如 136/114）。
+        # 用物理 y 坐标判断：尾部 2+ 位数字若与标题首字符不同行，则是独立页码，剥离到 layout 段。
+        _tail_page_chars: list[il_version_1.PdfCharacter] = []
+        if page_s is None and page_e is None and title_chars:
+            _tm = re.search(r"(?<!\d)\d{2,}$", text[inline_num_end:title_e])
+            if _tm:
+                _num_start = inline_num_end + _tm.start()
+                try:
+                    _first = self._char_box(title_chars[0])
+                    _num = self._char_box(chars[_num_start])
+                    if (
+                        _first is not None
+                        and _num is not None
+                        and _first.y is not None
+                        and _num.y is not None
+                    ):
+                        _line_h = (_first.y2 or _first.y) - _first.y
+                        if _line_h <= 0:
+                            _line_h = 10.0
+                        if abs(_num.y - _first.y) > _line_h * 0.5:
+                            _tail_page_chars = list(chars[_num_start:title_e])
+                            title_chars = chars[inline_num_end:_num_start]
+                except Exception:  # noqa: BLE001
+                    pass
         # 布局段 = 点线 + 页码（页码在前移结构下位于标题之前，单独收集）
         layout_chars = list(chars[leader_s:leader_e])
         if page_s is not None and page_e is not None:
             layout_chars += list(chars[page_s:page_e])
+        layout_chars = _tail_page_chars + layout_chars
         if inline_num_end > header_end:
             layout_chars = list(chars[header_end:inline_num_end]) + layout_chars
         header_chars = list(chars[title_s:header_end]) if header_end > title_s else []

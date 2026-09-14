@@ -1016,6 +1016,97 @@ class ILTranslator:
 
         return result
 
+    def _recover_missing_formula_placeholders(
+        self,
+        input_text,
+        translated_text: str,
+    ) -> str:
+        """把 LLM 丢弃的公式占位符按原文顺序插回正确位置，而非一律追加到段尾。
+
+        弱模型经常丢弃 {vN} 公式占位符（方括号/希腊字母/上下标等），原实现把它们统一追加
+        到译文末尾，导致 Ω / [ ] / 上下标等内容跑到段尾。这里利用富文本占位符
+        <style id='N'> 与幸存的公式占位符作为锚点：把每个丢失的公式占位符插到它"下一个
+        幸存占位符"之前（即原文中紧随其后的那个占位符），从而恢复到大致正确的位置。
+        """
+        placeholders = getattr(input_text, "placeholders", None)
+        if not placeholders:
+            return translated_text
+
+        tokens = []  # (token, regex, is_formula)
+        for ph in placeholders:
+            if isinstance(ph, FormulaPlaceholder):
+                tokens.append((ph.placeholder, ph.regex_pattern, True))
+            else:
+                tokens.append((ph.left_placeholder, ph.left_regex_pattern, False))
+                tokens.append((ph.right_placeholder, ph.right_regex_pattern, False))
+
+        # 按插入位置分组：anchor_pos -> [(token_index, token)]
+        pos_map: dict[int, list[tuple[int, str]]] = {}
+        for i, (tok, rgx, is_formula) in enumerate(tokens):
+            if not is_formula:
+                continue
+            if re.search(rgx, translated_text, re.IGNORECASE):
+                continue
+            anchor = None
+            for j in range(i + 1, len(tokens)):
+                m = re.search(tokens[j][1], translated_text, re.IGNORECASE)
+                if m:
+                    anchor = m.start()
+                    break
+            if anchor is None:
+                anchor = len(translated_text)
+            pos_map.setdefault(anchor, []).append((i, tok))
+
+        if not pos_map:
+            return translated_text
+
+        # 从右到左插入，避免位置偏移；同一位置的多个占位符按原文顺序排出。
+        for pos in sorted(pos_map.keys(), reverse=True):
+            group = sorted(pos_map[pos])
+            for _i, tok in reversed(group):
+                translated_text = translated_text[:pos] + tok + translated_text[pos:]
+        return translated_text
+
+    def _convert_llm_subsup_to_placeholders(
+        self,
+        input_text,
+        translated_text: str,
+    ) -> str:
+        """把 LLM 自造的 <sub>X</sub>/<sup>X</sup> 映射回被丢弃的公式占位符。
+
+        弱模型常把公式占位符 {vN}（如 SiO2 的下标 2）改写成 <sub>2</sub>，丢掉了 {vN}。
+        后处理若把 <sub>/<sup> 标签 strip 成正文会丢失上下标，再把 {vN} 追到段尾则重复。
+        这里先把 <sub>C</sub>/<sup>C</sup>（C 为某丢失公式的内容）替换回 {vN}，使
+        parse_translate_output 能在原位回填成真正的上/下标公式。
+        """
+        placeholders = getattr(input_text, "placeholders", None)
+        if not placeholders:
+            return translated_text
+
+        for ph in placeholders:
+            if not isinstance(ph, FormulaPlaceholder):
+                continue
+            if re.search(ph.regex_pattern, translated_text, re.IGNORECASE):
+                continue  # 占位符还在，无需处理
+            content = "".join(
+                c.char_unicode for c in (ph.formula.pdf_character or [])
+            )
+            if not content:
+                continue
+            m = re.search(
+                r"<sub\s*>" + re.escape(content) + r"</sub>|<sup\s*>"
+                + re.escape(content)
+                + r"</sup>",
+                translated_text,
+                re.IGNORECASE,
+            )
+            if not m:
+                continue
+            translated_text = (
+                translated_text[: m.start()] + ph.placeholder + translated_text[m.end():]
+            )
+        return translated_text
+
     def pre_translate_paragraph(
         self,
         paragraph: PdfParagraph,
@@ -1073,7 +1164,11 @@ class ILTranslator:
         translated_text = re.sub(r"\*{2,}", "", translated_text)
         translated_text = re.sub(r"_{2,}", "", translated_text)
         translated_text = re.sub(r"~{2,}", "", translated_text)
-        # 清理所有 <sub>/<sup> 标签（提取内容，去掉标签壳）
+        # 先把 LLM 自造的 <sub>/<sup>（内容对应某丢弃公式）映射回占位符，保留上下标
+        translated_text = self._convert_llm_subsup_to_placeholders(
+            translate_input, translated_text
+        )
+        # 清理剩余的 <sub>/<sup> 标签（提取内容，去掉标签壳）
         # 这些标签是 LLM 凭空生成的，引擎从不产生它们（引擎用 <style id='N'> 作富文本占位符）
         # 空 <sup></sup> -> 空；有内容 <sup>[53]</sup> -> [53]
         translated_text = re.sub(r"</?(?:sub|sup)>", "", translated_text)
@@ -1092,21 +1187,18 @@ class ILTranslator:
             .replace("◦C", "℃")
             .replace("°℃", "℃")
         )
-        # 检测公式占位符丢失：LLM 丢弃 {vN} 占位符会导致公式内容丢失
-        # 将丢失的占位符追加到译文末尾，使 parse_translate_output 能回填公式内容
-        # （位置不理想但优于完全丢失）
-        if hasattr(translate_input, "placeholders") and translate_input.placeholders:
-            for ph in translate_input.placeholders:
-                if isinstance(ph, FormulaPlaceholder):
-                    if not re.search(
-                        ph.regex_pattern, translated_text, re.IGNORECASE
-                    ):
-                        logger.warning(
-                            f"Formula placeholder {ph.placeholder} lost in "
-                            f"translation, appending to end. "
-                            f"Paragraph debug_id: {paragraph.debug_id}"
-                        )
-                        translated_text = translated_text.rstrip() + ph.placeholder
+        # 检测公式占位符丢失：LLM 丢弃 {vN} 占位符会导致公式内容丢失。
+        # 原实现把丢失的占位符一律追加到段尾，导致 Ω / [ ] / 上下标等内容跑到末尾。
+        # 改为按原文顺序插回"下一个幸存占位符"之前，恢复到大致正确的位置。
+        recovered = self._recover_missing_formula_placeholders(
+            translate_input, translated_text
+        )
+        if recovered != translated_text:
+            logger.warning(
+                f"Recovered lost formula placeholders in translation. "
+                f"Paragraph debug_id: {paragraph.debug_id}"
+            )
+        translated_text = recovered
         if translated_text == translate_input:
             if llm_translate_tracker := tracker.last_llm_translate_tracker():
                 llm_translate_tracker.set_placeholder_full_match()
