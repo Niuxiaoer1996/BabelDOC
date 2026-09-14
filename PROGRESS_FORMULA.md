@@ -7,9 +7,10 @@
 > 已本地提交。详见 §二十四。
 
 ## 〇、当前 git 状态
-- 分支：`fix/toc-formula-digits`（基于 main）。
+- 分支：`main`（`fix/toc-formula-digits` 已 fast-forward 合并到 main）。
 - BabelDOC 本批改动（公式/布局①②③⑥/page80角标/IfD/目录长标题页码/Form XObject box/截断防御/
-  标题分隔符保护）**已清理 debug 插桩并本地提交**，**未 push**。
+  标题分隔符保护）**已清理 debug 插桩、本地提交、push 远端 `Niuxiaoer1996/BabelDOC` 的 main**。
+  提交 `665b8a0`。`fix/toc-formula-digits` 分支也已 push。
 - `PROGRESS_FORMULA.md` 已纳入提交。
 - pdf2zh-domain 已提交（本地，未 push）：`7cc7882`（命名+hint 标签 + 提示词化学式/µm 约束）、
   `b7e2c13`（术语表新增）。
@@ -450,4 +451,5 @@ networks, Hong et al. [43] ... the through plane conductivity soared to 5.77 W m
 
 ### 已提交
 - 本批改动（公式修复、布局①②③⑥、page80 角标、If D 合并、目录长标题/页码、Form XObject box、截断防御、
-  标题分隔符保护）已清理 debug 插桩后**本地提交**（未 push）。
+  标题分隔符保护）已清理 debug 插桩后提交 `665b8a0`，**fast-forward 合并到 main 并 push 远端**
+  （`Niuxiaoer1996/BabelDOC`）。

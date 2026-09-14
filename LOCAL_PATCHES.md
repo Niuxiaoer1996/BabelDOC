@@ -997,7 +997,7 @@
 
 ## 41. 公式/布局/角标/IfD 批量修复（2026-09-14，分支 fix/toc-formula-digits）
 
-- **Commit**: 未提交（本批改动，含多文件）
+- **Commit**: `665b8a0`（已合并到 main 并 push 远端 `Niuxiaoer1996/BabelDOC`）
 - **症状（electronics-14-02682 + NB25036-MRCD02_Spec）**：
   1. 公式符号/上下标被 LLM 丢弃后跑到段尾（µ→×、×→· 目标字体映射错误）
   2. 布局①参数解释（where...）逐行被合并成一段；③译文字号过小/挤一行（Kikuchi 段被压扁）；
