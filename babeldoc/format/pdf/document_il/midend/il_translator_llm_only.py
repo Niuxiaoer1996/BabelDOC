@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from string import Template
 
@@ -666,6 +667,7 @@ class ILTranslatorLLMOnly:
             llm_translate_trackers = []
             paragraph_unicodes = []
             for i in range(len(batch_paragraph.paragraphs)):
+                self.translation_config.raise_if_cancelled()
                 paragraph = batch_paragraph.paragraphs[i]
                 tracker = batch_paragraph.trackers[i]
                 text, translate_input = self.il_translator.pre_translate_paragraph(
@@ -804,6 +806,7 @@ class ILTranslatorLLMOnly:
                 )
 
             for id_, output in translation_results.items():
+                self.translation_config.raise_if_cancelled()
                 should_fallback = True
                 try:
                     if not isinstance(output, str):
@@ -939,7 +942,8 @@ class ILTranslatorLLMOnly:
                         self.ok_count += 1
 
         except Exception as e:
-            error_message = f"Error {e} during translation. try fallback"
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            error_message = f"[{ts}] Error {e} during translation. try fallback"
             logger.warning(error_message)
             for llm_translate_tracker in llm_translate_trackers:
                 llm_translate_tracker.set_error_message(error_message)
@@ -953,6 +957,7 @@ class ILTranslatorLLMOnly:
                     range(len(batch_paragraph.paragraphs))
                 )
             for i in should_translate_paragraph:
+                self.translation_config.raise_if_cancelled()
                 paragraph = batch_paragraph.paragraphs[i]
                 tracker = batch_paragraph.trackers[i]
                 if paragraph.debug_id is None:
