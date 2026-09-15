@@ -1055,6 +1055,30 @@
   过载超时（qps 过高）所致，属正常降级保护，非本补丁问题；可考虑降低 qps。
 - **上游价值**: 批处理循环对取消响应不及时属普适缺陷，可考虑提 PR。
 
+## 43. 括号续接水平豁免：修复问题7 全篇叠印（2026-09-15，JESD238B 第23页第2小点）
+
+- **Commit**: `eb65a91`（本地 main，未 push）
+- **症状**: 问题7 全篇/大窗口翻译时，第23页初始化步骤第2小点第一行被布局模型横切成
+  两个**水平相邻**碎片（`"2. RESET...VDDQ"` + `") before or at the same time when"`），
+  各碎片独立翻译、独立排版，译文叠印不可读。补丁36（`is_paren_cont`，垂直续接）无法解决：
+  水平相邻碎片 `x_overlap ≈ 0`（两段首尾相接、几乎不重叠），不满足
+  `merge_mid_sentence_continuation_paragraphs` 的 `x_overlap > 0.5*min_w` 几何条件。
+- **根因**: 两个合并函数存在覆盖盲区——
+  - `merge_mid_sentence_continuation_paragraphs`：`is_paren_cont` 认 `)` 开头，但只处理
+    **垂直续接**（b 在 a 正下方，要求 x 方向重叠），水平相邻碎片 x_overlap≈0 被 GEO-SKIP。
+  - `merge_title_caption_and_table_fragments`：处理**水平相邻**碎片，但只认小写字母/标题类/
+    下标/fallback 前缀续接，**不认 `)` 开头**，段83/84 被跳过。
+- **修复**（`paragraph_finder.py` `merge_title_caption_and_table_fragments`）:
+  新增 `is_paren_horiz_cont`：a 文本末尾存在未闭合左括号（`(` 数 > `)` 数）且 b 以 `)`/`]`
+  开头时，豁免"小写字母开头"判定，允许同一行水平相邻的括号续接碎片合并。
+  与补丁36 的 `is_paren_cont` 互补（一个管垂直续接、一个管水平相邻）。
+- **验证**: 用户重跑 `-p 22-23`（复现叠印），第2小点合并成完整一段
+  （`2. RESET...VDDQ) before or at the same time when tINIT0 expires ...`，页段落数 88→87），
+  **叠印消失**。单页（`-p 23`）原本正常，不受影响。
+- **上游价值**: 属上游普适缺陷（布局把括号内容同段横切成水平相邻碎片），可考虑提 PR。
+
+
+
 
 
 

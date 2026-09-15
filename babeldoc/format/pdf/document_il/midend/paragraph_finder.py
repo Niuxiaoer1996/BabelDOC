@@ -1225,6 +1225,16 @@ class ParagraphFinder:
                 a_label = a.layout_label or ""
                 b_label = b.layout_label or ""
                 is_lower_cont = first_ch.islower()
+                # 括号水平续接：a 以未闭合的左括号结尾（如 "(below 0.2 × VDDQ"）、
+                # b 以右括号开头（如 ") before..."），且两者同一行水平相邻。版面模型
+                # 把括号内长句在同一行横切（如问题7 的第2小点），b 以 ")" 开头既非小写
+                # 字母也非下标，常规水平合并判定失效；此处豁免（与 merge_mid_sentence
+                # 的 is_paren_cont 互补——那里处理垂直续接，这里处理水平相邻）。
+                is_paren_horiz_cont = bool(
+                    first_ch in ")]"
+                    and (self._paragraph_text_ascii(a).rstrip().count("(")
+                         - self._paragraph_text_ascii(a).rstrip().count(")")) > 0
+                )
                 # 标题类片段对（title/table_caption/figure_caption/fallback_line）：
                 # 长标题横切处 box 常轻微重叠 1-2pt（如 "2.6. Research...T" + "echnology"），
                 # 且续接片段可能以 "." 开头（如 "3" + ".3.1. Importance..."）。对标题对
@@ -1271,6 +1281,7 @@ class ParagraphFinder:
                     or is_title_pair
                     or is_subscript_cont
                     or is_fallback_prefix
+                    or is_paren_horiz_cont
                 ):
                     continue
                 if abs(h_gap) < best_gap:
