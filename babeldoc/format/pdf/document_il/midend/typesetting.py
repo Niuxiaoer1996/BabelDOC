@@ -888,8 +888,15 @@ class Typesetting:
                         ):
                             fonts[xobj.xobj_id][font.font_id] = font
 
+            # 表格绕排障碍（in_table_layout 段落）只依赖 page，不依赖具体段落。
+            # 在 page 级只算一次，供该页所有非表格段落复用，避免每段重复 O(段落数²) 收集。
+            page_table_barriers = self._compute_table_barriers(page)
+
             # 处理每个段落
             for paragraph in page.pdf_paragraph:
+                # Ctrl+C 取消检查：单个段落的排版计算可能耗时很长（如表格密集页），
+                # 若在段落之间检查，取消事件需等到当前段落算完才生效，可能卡住数十分钟。
+                self.translation_config.raise_if_cancelled()
                 all_paragraphs.append(paragraph)
                 unit_count = 0
                 try:
@@ -904,8 +911,14 @@ class Typesetting:
                         paragraph.optimal_scale = 1.0
                     else:
                         # 获取最优缩放因子
+                        # 表格自身单元格不参与绕排，传 None（与原有行为一致）。
+                        _tb = (
+                            page_table_barriers
+                            if not getattr(paragraph, "in_table_layout", False)
+                            else None
+                        )
                         optimal_scale = self._get_optimal_scale(
-                            paragraph, page, typesetting_units
+                            paragraph, page, typesetting_units, table_barriers=_tb
                         )
                         paragraph.optimal_scale = optimal_scale
                 except Exception as e:
@@ -1006,6 +1019,41 @@ class Typesetting:
             return Box(box.x, box.y - expand, box.x2, box.y2 + expand)
         return box
 
+    def _compute_table_barriers(self, page: il_version_1.Page) -> list | None:
+        """收集一页的表格单元格框（in_table_layout 段落）作为正文绕排的障碍。
+
+        正文段落排版时若某行与表格区域重叠，则右缘收窄到表格左缘，避免重叠。
+        仅对非表格段落生效（表格自身单元格不参与自身绕排）。
+
+        该结果只依赖 page，不依赖具体段落，因此可在 page 级只算一次，
+        供该页所有段落复用，避免在 _find_optimal_scale_and_layout 里对每个段落
+        重复执行 O(段落数 × 表格单元格数) 的收集（表格密集页会成为性能瓶颈）。
+        """
+        if page is None:
+            return None
+        table_barriers = [
+            p for p in page.pdf_paragraph
+            if getattr(p, "in_table_layout", False) and p.box is not None
+        ]
+        # 表格标题（caption）常不是 in_table_layout（布局模型可能判为 plain text），
+        # 但正文第一行若与其同 y 带且全宽，会覆盖标题。用几何识别补入：
+        # 与任一 in_table 单元格在 x 上重叠 > 50%，且在 y 上紧邻（< 6pt）的段落，
+        # 视为该表格的标题，同样作为绕排障碍（正文绕开标题所在列）。
+        if table_barriers:
+            _cell_boxes = [p.box for p in table_barriers]
+            for _p in page.pdf_paragraph:
+                if getattr(_p, "in_table_layout", False) or _p.box is None:
+                    continue
+                _b = _p.box
+                for _tb in _cell_boxes:
+                    _xov = min(_b.x2, _tb.x2) - max(_b.x, _tb.x)
+                    _w = min(_b.x2 - _b.x, _tb.x2 - _tb.x)
+                    if _xov > 0 and _w > 0 and _xov / _w > 0.5:
+                        if abs(_b.y2 - _tb.y) < 6 or abs(_b.y - _tb.y2) < 6:
+                            table_barriers.append(_p)
+                            break
+        return table_barriers
+
     def _find_optimal_scale_and_layout(
         self,
         paragraph: il_version_1.PdfParagraph,
@@ -1033,32 +1081,11 @@ class Typesetting:
             return initial_scale, None
 
         # 收集表格单元格框（in_table_layout 段落）作为正文绕排的障碍。
-        # 正文段落排版时若某行与表格区域重叠，则右缘收窄到表格左缘，避免重叠。
         # 仅对非表格段落生效（表格自身单元格不参与自身绕排）。
         if table_barriers is None and page is not None and not getattr(
             paragraph, "in_table_layout", False
         ):
-            table_barriers = [
-                p for p in page.pdf_paragraph
-                if getattr(p, "in_table_layout", False) and p.box is not None
-            ]
-            # 表格标题（caption）常不是 in_table_layout（布局模型可能判为 plain text），
-            # 但正文第一行若与其同 y 带且全宽，会覆盖标题。用几何识别补入：
-            # 与任一 in_table 单元格在 x 上重叠 > 50%，且在 y 上紧邻（< 6pt）的段落，
-            # 视为该表格的标题，同样作为绕排障碍（正文绕开标题所在列）。
-            if table_barriers:
-                _cell_boxes = [p.box for p in table_barriers]
-                for _p in page.pdf_paragraph:
-                    if getattr(_p, "in_table_layout", False) or _p.box is None:
-                        continue
-                    _b = _p.box
-                    for _tb in _cell_boxes:
-                        _xov = min(_b.x2, _tb.x2) - max(_b.x, _tb.x)
-                        _w = min(_b.x2 - _b.x, _tb.x2 - _tb.x)
-                        if _xov > 0 and _w > 0 and _xov / _w > 0.5:
-                            if abs(_b.y2 - _tb.y) < 6 or abs(_b.y - _tb.y2) < 6:
-                                table_barriers.append(_p)
-                                break
+            table_barriers = self._compute_table_barriers(page)
 
         box = paragraph.box
         scale = initial_scale
@@ -1070,6 +1097,9 @@ class Typesetting:
         final_typeset_units = None
 
         while scale >= min_scale:
+            # Ctrl+C 取消检查：单个段落的缩放尝试可能循环多次且每次 O(n²) 排版，
+            # 若不在此检查，取消事件要等该段落全部缩放尝试结束才生效。
+            self.translation_config.raise_if_cancelled()
             try:
                 # 尝试布局排版单元
                 typeset_units, all_units_fit = self._layout_typesetting_units(
@@ -1182,6 +1212,7 @@ class Typesetting:
         page: il_version_1.Page,
         typesetting_units: list[TypesettingUnit],
         use_english_line_break: bool = True,
+        table_barriers: list | None = None,
     ) -> float:
         """获取段落的最优缩放因子，不执行实际排版"""
         scale, _ = self._find_optimal_scale_and_layout(
@@ -1191,6 +1222,7 @@ class Typesetting:
             1.0,
             use_english_line_break,
             apply_layout=False,
+            table_barriers=table_barriers,
         )
         return scale
 
@@ -1201,6 +1233,7 @@ class Typesetting:
         typesetting_units: list[TypesettingUnit],
         precomputed_scale: float,
         use_english_line_break: bool = True,
+        table_barriers: list | None = None,
     ):
         """使用预计算的缩放因子进行排版"""
         if not paragraph.box:
@@ -1214,6 +1247,7 @@ class Typesetting:
             precomputed_scale,
             use_english_line_break,
             apply_layout=True,
+            table_barriers=table_barriers,
         )
 
     def typesetting_document(self, document: il_version_1.Document):
@@ -1361,9 +1395,19 @@ class Typesetting:
                 f"Failed to avoid images on page {page.page_number}: {e}"
             )
 
+        # 表格绕排障碍（in_table_layout 段落）只依赖 page，page 级算一次供该页段落复用。
+        page_table_barriers = self._compute_table_barriers(page)
+
         # 开始实际的渲染过程
         for paragraph in page.pdf_paragraph:
-            self.render_paragraph(paragraph, page, fonts)
+            # Ctrl+C 取消检查：render_paragraph 内部同样执行完整排版（O(n²)），可能耗时较长。
+            self.translation_config.raise_if_cancelled()
+            _tb = (
+                page_table_barriers
+                if not getattr(paragraph, "in_table_layout", False)
+                else None
+            )
+            self.render_paragraph(paragraph, page, fonts, table_barriers=_tb)
 
     def add_watermark(self, page: il_version_1.Page):
         page_width = page.cropbox.box.x2 - page.cropbox.box.x
@@ -1407,6 +1451,7 @@ class Typesetting:
             str | int,
             il_version_1.PdfFont | dict[str, il_version_1.PdfFont],
         ],
+        table_barriers: list | None = None,
     ):
         typesetting_units = self.create_typesetting_units(paragraph, fonts)
         # 如果所有单元都可以直接传递，则直接传递
@@ -1424,26 +1469,15 @@ class Typesetting:
             # 如果有单元无法直接传递，则进行重排版
             paragraph.pdf_paragraph_composition = []
             self.retypeset_with_precomputed_scale(
-                paragraph, page, typesetting_units, precomputed_scale
+                paragraph,
+                page,
+                typesetting_units,
+                precomputed_scale,
+                table_barriers=table_barriers,
             )
 
             # 重排版后，重新设置段落各字符的 render order
             self._update_paragraph_render_order(paragraph)
-
-    def _get_width_before_next_break_point(
-        self, typesetting_units: list[TypesettingUnit], scale: float
-    ) -> float:
-        if not typesetting_units:
-            return 0
-        if typesetting_units[0].can_break_line:
-            return 0
-
-        total_width = 0
-        for unit in typesetting_units:
-            if unit.can_break_line:
-                return total_width * scale
-            total_width += unit.width
-        return total_width * scale
 
     def _layout_typesetting_units(
         self,
@@ -1512,6 +1546,18 @@ class Typesetting:
         line_ys = [current_y]
         if paragraph.first_line_indent and getattr(paragraph, "toc_role", None) != "title":
             current_x += space_width * 4
+        # 预计算每个位置到下一个可换行点（不含该断点）的累计宽度，把原 O(n²) 的
+        # _get_width_before_next_break_point(typesetting_units[i:]) 降为 O(n)。
+        # 从后往前：width_to_next_break[i] = 从 i 开始累加 unit.width 直到（不含）
+        # 下一个 can_break_line 单元，或到列表末尾。
+        width_to_next_break: list[float] = [0.0] * len(typesetting_units)
+        _acc = 0.0
+        for _i in range(len(typesetting_units) - 1, -1, -1):
+            _u = typesetting_units[_i]
+            _acc += _u.width
+            if _u.can_break_line:
+                _acc = 0.0
+            width_to_next_break[_i] = _acc
         # 遍历所有排版单元
         for i, unit in enumerate(typesetting_units):
             # 计算当前单元在当前缩放下的尺寸
@@ -1549,9 +1595,7 @@ class Typesetting:
             ):
                 current_x += space_width * 0.5
             if use_english_line_break:
-                width_before_next_break_point = self._get_width_before_next_break_point(
-                    typesetting_units[i:], scale
-                )
+                width_before_next_break_point = width_to_next_break[i] * scale
             else:
                 width_before_next_break_point = 0
 
