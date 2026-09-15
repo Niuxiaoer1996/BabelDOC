@@ -1009,7 +1009,9 @@
   6. 译文被 LLM 提前截断（`，其` 结尾）；图表标题分隔符（`—`/`–`）被 LLM 随意改写
 - **修复**:
   - `styles_and_formulas.py`：`_CORNER_Y_RAISE_PT=2.0` y 偏移检测角标；跨 composition 传 `prev_char`
-    + `_cross_guard`（阈值=字符高度）修复 page80 角标；安全字符压制公式字体触发
+    + `_cross_guard`（阈值=字符高度）修复 page80 角标；安全字符压制公式字体触发；**`× · − < > ~ ± µ °`
+    从 `_PLAIN_INLINE_CHAR_RE`（普通文本集合）移除**——否则转文本会在目标 CJK 字体映射成错误字形
+    （µ→×、×→·），必须保持公式保原字形
   - `il_translator.py`：`_recover_missing_formula_placeholders`（丢占位符按原文顺序插回"下一幸存
     占位符"前）；`_convert_llm_subsup_to_placeholders`（`<sub>X</sub>` 映射回 `{vN}`）；图表标题分隔符
     保护 `{vSEP}`（`_TOC_TITLE_SEP_RE`）
@@ -1022,7 +1024,7 @@
 - **验证**: 用户重跑确认——MRCD02 page47 If D 正常、page80 角标正常、无空白段；electronics 图9化学式
   （提示词方案，Qwen 弱模型偶发翻译为已知限制）；截断防御与标题分隔符保护正常。
 - **已登记已知限制（接受）**：化学式翻译（Cu→铜）、公式占位符错位、目录页缩写展开、弱模型自身问题
-  （`39]` 重复等）。详见 PROGRESS_MERGED.md §十（已知问题接受清单）。
+  （`39]` 重复等）。详见 pdf2zh-domain README「问题状态总表」（已接受 K1-K5）。
 - **注意**: 化学式**程序化保护方案已完全回退**（曾引入空白段落回归），回到提示词方案。
 - **上游价值**: 布局①②③⑥、page80 角标、If D、Form XObject box 属上游普适缺陷，可考虑提 PR；
   公式占位符恢复/截断防御/标题分隔符保护属弱模型鲁棒性增强。
