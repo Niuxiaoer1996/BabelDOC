@@ -1079,6 +1079,35 @@
   **叠印消失**。单页（`-p 23`）原本正常，不受影响。
 - **上游价值**: 属上游普适缺陷（布局把括号内容同段横切成水平相邻碎片），可考虑提 PR。
 
+## 44. Typesetting 表格密集页卡死 + Ctrl+C 退不出（2026-09-15，JESD209 拆分 429-439 页）
+
+- **Commit**: `1cc551d`（当前 main，未 push）
+- **症状**: 翻译 JESD209 拆分任务（429-439 页），Typesetting 进度卡在 `1/22` 超过 30-50 分钟
+  无法推进；Ctrl+C 后进程**退不出**（排版循环无取消检查点）。
+- **定位**: 用 `py-spy dump` 附加卡住进程，栈显示卡在
+  `_find_optimal_scale_and_layout`（typesetting.py 原 line 1062）——即 **table_barriers
+  收集逻辑的几何识别双重嵌套循环**。第一页有 350 段落（207 段 in_table_layout + 159 段
+  fallback_line），该收集逻辑在每个段落调用时都重新执行，为 O(段落数 × 表格单元格数)
+  的重复计算（约千万次几何检查），成为表格密集页的性能瓶颈。换行的 O(n²) 并非主因
+  （字符规模仅 6.7 万）。
+- **修复**（`typesetting.py`，三类改动）:
+  1. **table_barriers 按页缓存（核心提速）**: 新增 `_compute_table_barriers(page)` 提取收集
+     逻辑（含几何补入 caption），结果只依赖 page 不依赖段落，改为在 `preprocess_document`
+     与 `render_page` 的 page 级**只算一次**，供该页所有非表格段落复用；表格自身单元格
+     （in_table_layout）仍传 None 保持不参与绕排，行为不变。
+  2. **Ctrl+C 取消检查（修复退不出）**: 在 `preprocess_document` 段落循环、
+     `_find_optimal_scale_and_layout` 的 while 缩放循环、`render_page` 段落渲染循环共 3 处
+     补 `raise_if_cancelled()`，使取消事件能中断排版循环（补丁42 只修了翻译批循环，
+     未覆盖排版阶段）。
+  3. **换行宽度 O(n²)→O(n)（辅助提速）**: `_layout_typesetting_units` 里
+     `_get_width_before_next_break_point(typesetting_units[i:])` 对每个字符切片扫描为 O(n²)，
+     改为预计算 `width_to_next_break[]` 数组（从后往前一次 O(n)），循环内 O(1) 查表，
+     并移除不再使用的旧方法。
+- **验证**: 用户重跑 JESD209 拆分任务，Typesetting `22/22` 仅用 **0:01:35** 跑完（原卡
+  30 分钟+）；Ctrl+C 可正常退出；PDF 输出排版正常无回归。
+- **上游价值**: table_barriers 重复收集与排版缺取消检查均属上游普适问题（表格密集页
+  通用），可考虑提 PR。
+
 
 
 
