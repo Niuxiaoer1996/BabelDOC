@@ -1,8 +1,8 @@
 # 进度记录总档：BabelDOC 公式 / TOC / 布局问题全量排查
 
-> 更新日期：2026-09-14。合并自 `PROGRESS_FORMULA.md`（公式问题）+ `MEMORY_TOC_ISSUE.md`（MRCD02 目录页 TOC 专项）。
+> 更新日期：2026-09-15。合并自 `PROGRESS_FORMULA.md`（公式问题）+ `MEMORY_TOC_ISSUE.md`（MRCD02 目录页 TOC 专项）。
 > 分支 `fix/toc-formula-digits` 已 fast-forward 合并到 main 并 push 远端 `Niuxiaoer1996/BabelDOC`（提交 `665b8a0`）。
-> 本档记录**问题现象、根因、解决方案与当前状态**；代码级修复细节见 `LOCAL_PATCHES.md` 补丁 38/39/40/41。
+> 本档记录**问题现象、根因、解决方案与当前状态**；代码级修复细节见 `LOCAL_PATCHES.md` 补丁 38/39/40/41/42。
 
 ---
 
@@ -34,6 +34,7 @@
 | S9 | FciYa 段译文截断 | `_is_truncated_translation` → fallback 重译 | ✅ |
 | S10 | 图表标题分隔符被 LLM 改写 | `il_translator.py` `{vSEP}` 占位符保护 | ✅ |
 | S11 | 目录页 TOC 全量（前移结构/点线驱动/页码恢复/标题切分/尾页单条点线/下划线判公式）| toc_processor 补丁38/39/40 + styles 下划线排除 | ✅ |
+| S12 | Ctrl+C 取消后进程退不出（线程池堆积）| `il_translator_llm_only.py` 批循环内部补 `raise_if_cancelled()`（含 fallback 提交循环）| ✅ 中途 Ctrl+C 干净退出 |
 
 ### 4. 已知问题（登记接受）
 
@@ -149,6 +150,7 @@
 
 - 分支：`main`（`fix/toc-formula-digits` 已 fast-forward 合并）。
 - BabelDOC 本批改动（公式/布局①②③⑥/page80角标/IfD/目录长标题页码/Form XObject box/截断防御/标题分隔符保护）**已清理 debug 插桩、本地提交 `665b8a0`、push 远端 `Niuxiaoer1996/BabelDOC` 的 main**。
+- BabelDOC 补丁42（Ctrl+C 取消退不出 + fallback 时间戳）本地提交 `e7dc1ae`，待 push。
 - pdf2zh-domain 已提交（本地，未 push）：`7cc7882`（命名+hint 标签 + 提示词化学式/µm 约束）、`b7e2c13`（术语表新增）。
 
 ## 十、已知问题接受清单（2026-09-14，用户确认）

@@ -1027,6 +1027,34 @@
 - **上游价值**: 布局①②③⑥、page80 角标、If D、Form XObject box 属上游普适缺陷，可考虑提 PR；
   公式占位符恢复/截断防御/标题分隔符保护属弱模型鲁棒性增强。
 
+## 42. Ctrl+C 取消后进程退不出 + fallback 报错无时间戳（2026-09-15，JESD209 翻译中断）
+
+- **Commit**: `e7dc1ae`（本地 main，未 push）
+- **症状（JESD209-5B-HJ.pdf 翻译到 82% 时 Ctrl+C）**：
+  1. Ctrl+C 后程序**无法退出**，终端卡住；日志在取消后仍持续输出大量
+     `Error Expecting value ... during translation. try fallback`（无时间戳的裸文本）
+  2. 主进程 `_translate_in_subprocess` 的 finally 已发取消信号并尝试 terminate/kill，
+     但子进程仍在批量提交 fallback 任务，`with PriorityThreadPoolExecutor` 退出时
+     `shutdown(wait=True)` 阻塞等待任务完成 → 进程迟迟无法结束
+- **根因**: `il_translator_llm_only.py` 的 `translate_paragraph`（批处理长循环）只在**方法入口**
+  检查一次 `raise_if_cancelled()`（line 662），进入内部循环后不再检查。Ctrl+C 中断 LLM HTTP 层
+  → 返回损坏/截断 JSON → 触发 `except Exception` → **fallback 提交循环不检查取消**，
+  把剩余段落全部塞进 fallback 线程池，导致 executor `shutdown(wait=True)` 阻塞。
+- **修复**:
+  - `il_translator_llm_only.py` 批循环内部补 3 处 `raise_if_cancelled()`：
+    1. 段落预处理循环（每段前）
+    2. 结果处理循环（每段前）
+    3. **fallback 提交循环（每段前）**——取消后立即中止，不再批量提交任务，executor 能快速关闭
+  - 注意：`raise_if_cancelled` 抛 `asyncio.CancelledError`（`BaseException` 子类），不会被
+    `except Exception` 吞掉，可正确传播中断批循环。
+  - fallback 报错消息嵌入显式时间戳 `[YYYY-MM-DD HH:MM:SS]`（`import time`），便于定位
+    报错发生在 Ctrl+C 之前还是之后（日志系统被打断时 logger 格式化不可靠）。
+- **验证**: 用户重跑 JESD209 翻译中途 Ctrl+C——**干净退出**（`KeyboardInterrupt`，无卡住、
+  无 fallback 刷屏）；fallback 报错带显式时间戳。修复有效。
+- **已知**: 偶发 `Expecting value` / `length mismatch` / `APITimeoutError` 为 LLM 服务端
+  过载超时（qps 过高）所致，属正常降级保护，非本补丁问题；可考虑降低 qps。
+- **上游价值**: 批处理循环对取消响应不及时属普适缺陷，可考虑提 PR。
+
 
 
 
