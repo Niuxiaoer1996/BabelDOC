@@ -20,9 +20,9 @@ def load_prepared_pdf_pages(
         temp_pdf_path,
         should_include_page=should_include_page,
     ) as raw_pages:
-        import fitz
+        import pymupdf
 
-        document = fitz.open(temp_pdf_path)
+        document = pymupdf.open(temp_pdf_path)
         try:
             object_store = build_object_store(document)
             object_access = (

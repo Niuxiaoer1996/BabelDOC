@@ -47,9 +47,9 @@ def load_page_views(
     *,
     should_include_page: Callable[[int], bool] | None = None,
 ):
-    import fitz
+    import pymupdf
 
-    document = fitz.open(pdf_path)
+    document = pymupdf.open(pdf_path)
     try:
         object_store = build_object_store(document)
         page_views: list[RawPageView] = []

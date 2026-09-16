@@ -1151,8 +1151,18 @@
   要求多行全为参数条目才拆分。
 - **上游价值**: 上下标 y_offset 匹配、`- ` 列表项识别、等号参数行识别均属上游普适缺陷，可考虑提 PR。
 
+## 46. `import fitz` 改为 `import pymupdf`（消除弃用警告）
 
-
-
-
+- **Commit**: （待提交）
+- **症状**: 每次翻译时终端打印
+  `warning: The \`fitz\` API is deprecated and will be removed in future. Use \`import pymupdf\` instead.`
+  来源不明（实际是 pymupdf 1.26+ 的 `fitz` 兼容层 `fitz/__init__.py` 打印的弃用警告）
+- **根因**: `babeldoc/format/pdf/new_parser/pymupdf_prepared_page_access.py` 与
+  `pymupdf_page_view_access.py` 各有一处 `import fitz` + `fitz.open(...)`。pymupdf 升级到
+  1.26.7+（为满足新版 BabelDOC 依赖）后，`fitz` 别名开始标记弃用，import 即触发警告
+- **修复**: 两处 `import fitz` → `import pymupdf`、`fitz.open(...)` → `pymupdf.open(...)`
+  （`pymupdf` 模块自带 `fitz` 兼容，二者等价）
+- **验证**: `import babeldoc.format.pdf.new_parser.pymupdf_page_view_access` 等模块
+  导入干净，无弃用警告
+- **上游价值**: 属上游普适问题，pymupdf 官方早已建议用 `import pymupdf`，可考虑提 PR
 
