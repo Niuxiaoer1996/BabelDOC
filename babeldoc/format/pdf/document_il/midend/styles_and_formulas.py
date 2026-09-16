@@ -35,6 +35,7 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_curve_overlapping_with_paragraphs,
 )
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_same_style
+from babeldoc.format.pdf.document_il.utils.layout_helper import formular_height_ignore_char
 
 # 严格 bullet 模式：仅包含真正的 bullet 字符（•、◦、■ 等），
 # 不包含上标/下标数字和字母（¹²³⁴⁵⁶⁷⁸⁹⁰₁₂₃₄₅₆₇₈₉₀ᵃᵇᶜ...），
@@ -899,6 +900,30 @@ class StylesAndFormulas:
             ),
         )
 
+    @staticmethod
+    def _compute_formula_char_box(formula: PdfFormula) -> Box:
+        """用公式字符的 char.box（非 visual_bbox）计算参考框，用于上下标同行判断。
+
+        formula.box 由 update_formula_data 用 visual_bbox（含字体 descent，随字号
+        成正比）计算。大字号主字符（如 V）descent 偏移大、小字号下标（如 REF）偏移
+        小，导致 formula.box 中上下标相对位置失真（下标被抬高）。这里改用 char.box
+        （不含 descent）计算，保留真实的上下标相对位置，供 process_page_offsets
+        兜底找回同行主字符、正确计算 y_offset。过滤规则与 update_formula_data 一致。
+        """
+        chars = [
+            ch
+            for ch in formula.pdf_character
+            if not formular_height_ignore_char(ch)
+        ]
+        if not chars:
+            chars = list(formula.pdf_character)
+        return Box(
+            min(ch.box.x for ch in chars),
+            min(ch.box.y for ch in chars),
+            max(ch.box.x2 for ch in chars),
+            max(ch.box.y2 for ch in chars),
+        )
+
     def process_page_offsets(self, page: Page):
         """计算公式的 x 和 y 偏移量"""
         if not page.pdf_paragraph:
@@ -919,51 +944,67 @@ class StylesAndFormulas:
                     continue
 
                 formula = composition.pdf_formula
-                left_char = None
-                right_char = None
 
-                left_iou = 0
-                right_iou = 0
+                def _find_adjacent_text(
+                    ref_box,
+                ) -> tuple[PdfCharacter | None, PdfCharacter | None]:
+                    """查找公式左右最近的同一行文本字符（基于 y 重叠 IOU）。
 
-                # 查找左边最近的同一行的文本
-                for j in range(i - 1, -1, -1):
-                    comp = paragraph.pdf_paragraph_composition[j]
-                    if comp.pdf_line:
-                        for char in reversed(comp.pdf_line.pdf_character):
-                            if not char.pdf_character_id:
-                                continue
-                            # 检查 y 坐标是否接近，判断是否在同一行
-                            left_iou = calculate_y_true_iou_for_boxes(
-                                formula.box, char.box
-                            )
-                            if left_iou > 0.6:
-                                left_char = char
-                                break
-                    break
+                    上下标（如 VREF 的 REF、MR16 OP[6]=1B 的 B）字号小、垂直偏移大，
+                    用 formula.box（基于 visual_bbox，含字体 descent）算 y 重叠时
+                    IOU 常 < 0.6 匹配不到同行主字符，导致 y_offset=0、下标方向丢失、
+                    渲染成上标。用公式字符本身的 char.box（不含 descent）作为参考框
+                    再找一次即可命中（见 _compute_formula_char_box）。
+                    """
+                    left = None
+                    right = None
+                    left_iou = 0.0
+                    right_iou = 0.0
+                    # 查找左边最近的同一行的文本
+                    for j in range(i - 1, -1, -1):
+                        comp = paragraph.pdf_paragraph_composition[j]
+                        if comp.pdf_line:
+                            for char in reversed(comp.pdf_line.pdf_character):
+                                if not char.pdf_character_id:
+                                    continue
+                                # 检查 y 坐标是否接近，判断是否在同一行
+                                left_iou = calculate_y_true_iou_for_boxes(
+                                    ref_box, char.box
+                                )
+                                if left_iou > 0.6:
+                                    left = char
+                                    break
+                        break
+                    # 查找右边最近的同一行的文本
+                    for j in range(i + 1, len(paragraph.pdf_paragraph_composition)):
+                        comp = paragraph.pdf_paragraph_composition[j]
+                        if comp.pdf_line:
+                            for char in comp.pdf_line.pdf_character:
+                                if not char.pdf_character_id:
+                                    continue
+                                # 检查 y 坐标是否接近，判断是否在同一行
+                                right_iou = calculate_y_true_iou_for_boxes(
+                                    ref_box, char.box
+                                )
+                                if right_iou > 0.6:
+                                    right = char
+                                    break
+                        break
+                    # If both text segments exist, keep the one with higher IOU
+                    if left and right:
+                        if left_iou < right_iou:
+                            left = None
+                        elif right_iou < left_iou:
+                            right = None
+                    return left, right
 
-                # 查找右边最近的同一行的文本
-                for j in range(i + 1, len(paragraph.pdf_paragraph_composition)):
-                    comp = paragraph.pdf_paragraph_composition[j]
-                    if comp.pdf_line:
-                        for char in comp.pdf_line.pdf_character:
-                            if not char.pdf_character_id:
-                                continue
-                            # 检查 y 坐标是否接近，判断是否在同一行
-                            right_iou = calculate_y_true_iou_for_boxes(
-                                formula.box, char.box
-                            )
-                            if right_iou > 0.6:
-                                right_char = char
-                                break
-                    break
-
-                # If both text segments exist, keep the one with higher IOU
-                if left_char and right_char:
-                    if left_iou < right_iou:
-                        left_char = None
-                    elif right_iou < left_iou:
-                        right_char = None
-                    # If IOUs are equal, keep both
+                left_char, right_char = _find_adjacent_text(formula.box)
+                if left_char is None and right_char is None:
+                    # 兜底：用公式字符的 char.box（不含 descent）参考框再找一次，
+                    # 修复上下标（小字号）因 visual_bbox 偏移导致 IOU 不足、方向丢失。
+                    left_char, right_char = _find_adjacent_text(
+                        self._compute_formula_char_box(formula)
+                    )
 
                 # 计算 x 偏移量（相对于左边文本）
                 if left_char:

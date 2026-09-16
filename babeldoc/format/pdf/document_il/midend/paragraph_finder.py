@@ -547,7 +547,17 @@ class ParagraphFinder:
         try:
             comps = p.pdf_paragraph_composition or []
             if comps and comps[0].pdf_line and comps[0].pdf_line.pdf_character:
-                return is_bullet_point(comps[0].pdf_line.pdf_character[0])
+                chars = comps[0].pdf_line.pdf_character
+                if is_bullet_point(chars[0]):
+                    return True
+                # 行首连字符 "-" + 空格 的文本无序列表项（与 _is_list_item_start 一致），
+                # 防止拆开的 "- " 列表项被 merge_mid_sentence_continuation_paragraphs 重新合并。
+                if (
+                    len(chars) > 1
+                    and chars[0].char_unicode == "-"
+                    and chars[1].char_unicode == " "
+                ):
+                    return True
         except Exception:
             pass
         return False
@@ -607,14 +617,25 @@ class ParagraphFinder:
     # 冒号前是纯英文单词（>=4 字母，如 Received/Revised/Accepted/Published）时不视为
     # 参数符号（这些是日期/版权等元信息行，不应拆分）。
     _PARAM_ENGLISH_WORD_RE = re.compile(r"^[A-Za-z]{4,}$")
+    # "符号 = 描述"（等号分隔）参数条目：符号以大写字母开头、可含空格（如
+    # "Run Time = Total time..."、"WCK2DQ delay = ..."）。限定大写开头 + 多词，
+    # 避免把正文小写等式（"x = 5"）或单符号定义误判为参数行。
+    _PARAM_EQ_ENTRY_RE = re.compile(
+        r"^([A-Z][A-Za-z0-9]+(?:\s+[A-Za-z0-9]+)*)\s*=\s*.+"
+    )
 
     def _is_parameter_entry_line(self, line_text: str) -> bool:
-        """判断一行是否为"短变量符号 : 描述"的参数条目。"""
+        """判断一行是否为"短变量符号 : 描述"或"符号 = 描述"的参数条目。"""
         if not line_text:
             return False
         m = self._PARAM_ENTRY_RE.match(line_text)
         if not m:
-            return False
+            # 等号分隔的"符号 = 描述"（符号以大写字母开头、可含空格，如
+            # "Run Time = Total time..."、"WCK2DQ delay = ..."）。
+            m2 = self._PARAM_EQ_ENTRY_RE.match(line_text)
+            if not m2:
+                return False
+            return True
         sym = m.group(1).strip()
         if not sym:
             return False
@@ -656,9 +677,17 @@ class ParagraphFinder:
                 new_paragraphs.append(paragraph)
                 continue
 
-            # 每行都必须是参数条目，才认为是参数解释段落
+            # 参数解释行：每行都必须是参数条目，才认为是参数解释段落。
+            # 允许段首 "Where:" / "Where" 引导行（公式下方 where 后参数解释的常见
+            # 前缀），引导行之后的每行才要求是参数条目。
+            start = 0
+            if line_texts and line_texts[0]:
+                _first = line_texts[0].lower().rstrip(":：").strip()
+                if _first in ("where",):
+                    start = 1
             if not all(
-                self._is_parameter_entry_line(t) for t in line_texts
+                self._is_parameter_entry_line(t)
+                for t in line_texts[start:]
             ):
                 new_paragraphs.append(paragraph)
                 continue
@@ -667,13 +696,15 @@ class ParagraphFinder:
                 f"Splitting parameter-explanation paragraph {paragraph.debug_id} "
                 f"into {len(comps)} paragraphs"
             )
-            for comp in comps:
+            for idx, comp in enumerate(comps):
                 sub_para = self._create_split_paragraph(paragraph, [comp])
                 if sub_para:
                     # 标记为"参数解释行"，使后续 merge（如 merge_mid_sentence_
                     # continuation_paragraphs）跳过，避免把拆开的参数行（如
                     # "CL : ...," + "V : ..."）因"逗号结尾 + 字母开头续接"重新合并。
-                    sub_para.is_parameter_explanation_line = True
+                    # Where 引导行（start 之前）不标记，保留其独立段落属性。
+                    if idx >= start:
+                        sub_para.is_parameter_explanation_line = True
                     new_paragraphs.append(sub_para)
 
         paragraphs.clear()
@@ -1946,6 +1977,17 @@ class ParagraphFinder:
         # 无序 bullet 点
         try:
             if is_bullet_point(first):
+                return True
+        except Exception:
+            pass
+        # 行首连字符 "-" + 空格 的文本无序列表项（如 "- Start WCK2DQI ..."）。
+        # 仅识别"连字符后紧跟空格"，避免把破折号/减号/负号（"-5"、"–"）误判为列表项。
+        try:
+            if (
+                first.char_unicode == "-"
+                and len(chars) > 1
+                and chars[1].char_unicode == " "
+            ):
                 return True
         except Exception:
             pass

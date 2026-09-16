@@ -1108,6 +1108,49 @@
 - **上游价值**: table_barriers 重复收集与排版缺取消检查均属上游普适问题（表格密集页
   通用），可考虑提 PR。
 
+## 45. 上下标方向丢失 + 无序列表/参数行合并（2026-09-16，JESD209 拆分 429-439 页）
+
+- **Commit**: （待提交）
+- **症状（JESD209-5B-HJ，`-p 429-439 --split --debug`）**:
+  1. **上下标方向丢失**：原文 `VREF` 的 `REF`、`MR16 OP[6]=1B/0B` 的 `B` 是**下标**
+     （baseline 比主字符低 ~1pt），译文渲染成**上标**（Page 401/402/405）。
+  2. **无序列表格式丢失 + 末尾两项合并**：Page 405 MPC 的 6 个 `-` 列表项被合并成一段
+     （`- Start ...- Stop ...` 换行丢失）。
+  3. **参数解释行合并**：Page 406 `where:` 下的 `Run Time = ...`、`WCK2DQ delay = ...`
+     两行被合并成一段。
+- **定位/根因**:
+  1. 上下标：`styles_and_formulas.process_page_offsets` 找同行主字符用 `formula.box`
+     （基于 visual_bbox，含字体 descent，随字号成正比）。大字号主字符（V）descent 偏移大、
+     小字号下标（REF）偏移小，导致 formula.box 中上下标相对位置失真（下标被抬高），
+     与主字符的 y IOU=0.49<0.6 匹配失败 → `left_char=None` → `y_offset=0` → 渲染成上标。
+     对比：上标 `16`（2^16）descent 抵消后 IOU 够、正常。渲染最终位置只取决于
+     `char.box.y - left_char.box.y`（真实上下标差），与 formula.box 无关，故只要 left_char
+     匹配成功即正确。
+  2. 无序列表：`is_bullet_point` 的 `BULLET_POINT_PATTERN` 不含 `-`（连字符），
+     `_ORDERED_LIST_ITEM_RE` 也不匹配 `- ` 行首，导致 `_is_list_item_start`/
+     `_paragraph_is_list_item_start` 不识别 `- ` 列表项 → `process_independent_paragraphs`
+     不拆分、`merge_mid_sentence_continuation_paragraphs` 不排除 → 6 行合并。
+  3. 参数行：`split_parameter_explanation_paragraphs` 要求**每行**都是参数条目，
+     `Where:` 引导行破坏条件；且 `_PARAM_ENTRY_RE` 只认"`符号:描述`"（冒号、符号不含空格），
+     `Run Time = 描述`（等号+含空格符号）不匹配。
+- **修复**:
+  1. 上下标（`styles_and_formulas.py`）：新增 `_compute_formula_char_box`（用公式字符的
+     `char.box` 计算参考框，不含 descent）+ `process_page_offsets` 的 left/right 查找封装成
+     `_find_adjacent_text(ref_box)`，原逻辑（`formula.box`）匹配失败时用 `char.box` 参考框
+     fallback 再找。**条件式 fallback**（只有原逻辑失败才触发），不影响原本正确公式。
+  2. 无序列表（`paragraph_finder.py`）：`_is_list_item_start` + `_paragraph_is_list_item_start`
+     增加"行首 `- `（连字符+空格）"识别（限定连字符后紧跟空格，避免误判 `-5`/破折号）。
+  3. 参数行（`paragraph_finder.py`）：新增 `_PARAM_EQ_ENTRY_RE`（`符号 = 描述`，符号以大写
+     字母开头、可含空格），`_is_parameter_entry_line` 冒号匹配失败时尝试等号匹配；
+     `split_parameter_explanation_paragraphs` 允许段首 `Where:` 引导行（引导行后每行才要求
+     是参数条目）。
+- **验证**: 用户重跑 `-p 429-439 --split --debug`——①Page 401/402/405 `VREF` 下标、`1B`/`0B`
+  下标恢复正常；②Page 405 MPC 无序列表恢复为 6 个独立 `-` 项；③Page 406 `where:` 下两行独立。
+- **风险控制**: 上下标 fallback 条件式触发，不影响原本正确公式（模拟 120 公式零破坏）；
+  `- ` 列表项限定"连字符+空格"；等号参数行限定"大写开头+可含空格"，且 `split_parameter_explanation`
+  要求多行全为参数条目才拆分。
+- **上游价值**: 上下标 y_offset 匹配、`- ` 列表项识别、等号参数行识别均属上游普适缺陷，可考虑提 PR。
+
 
 
 
