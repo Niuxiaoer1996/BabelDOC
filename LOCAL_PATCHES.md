@@ -1153,7 +1153,7 @@
 
 ## 46. `import fitz` 改为 `import pymupdf`（消除弃用警告）
 
-- **Commit**: （待提交）
+- **Commit**: `45c49e6`
 - **症状**: 每次翻译时终端打印
   `warning: The \`fitz\` API is deprecated and will be removed in future. Use \`import pymupdf\` instead.`
   来源不明（实际是 pymupdf 1.26+ 的 `fitz` 兼容层 `fitz/__init__.py` 打印的弃用警告）
