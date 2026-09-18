@@ -22,6 +22,7 @@ from babeldoc.format.pdf.document_il import PdfStyle
 from babeldoc.format.pdf.document_il import il_version_1
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
+from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
@@ -1110,6 +1111,7 @@ class Typesetting:
                     paragraph,
                     use_english_line_break,
                     table_barriers,
+                    page,
                 )
 
                 # 如果所有单元都放得下
@@ -1488,6 +1490,7 @@ class Typesetting:
         paragraph: il_version_1.PdfParagraph,
         use_english_line_break: bool = True,
         table_barriers: list[Box] | None = None,
+        page: il_version_1.Page | None = None,
     ) -> tuple[list[TypesettingUnit], bool]:
         """布局排版单元。
 
@@ -1545,7 +1548,48 @@ class Typesetting:
         last_unit: TypesettingUnit | None = None
         line_ys = [current_y]
         if paragraph.first_line_indent and getattr(paragraph, "toc_role", None) != "title":
-            current_x += space_width * 4
+            # 列表项（段落以 bullet 字符开头，如 `•`/`?` 后跟空格）不应应用首行缩进，
+            # 否则整个列表项（含 bullet 和后续文字/公式）会整体右移，与原文不对齐
+            # （Page 408 图235/图236 下方无序列表因此偏右；图235 文字右移还导致
+            # 分式放不下而换行退到下一行开头）。
+            _is_list_item = bool(
+                typesetting_units
+                and typesetting_units[0].try_get_unicode()
+                and (
+                    BULLET_POINT_PATTERN.match(
+                        typesetting_units[0].try_get_unicode()
+                    )
+                    or (
+                        typesetting_units[0].try_get_unicode() == "?"
+                        and len(typesetting_units) > 1
+                        and typesetting_units[1].try_get_unicode() == " "
+                    )
+                )
+            )
+            # 列表项续行：当前段落不是以 bullet 开头，但同一 y 带左侧有一个以 bullet
+            # 开头的段落（如 Page 408 图235 的列表项2 被拆成 para87 bullet + para88
+            # 文本/分式两个段落）。此类续行同样不应首行缩进。
+            if not _is_list_item and paragraph.box is not None:
+                _pb = paragraph.box
+                for _other in page.pdf_paragraph:
+                    if _other is paragraph or _other.box is None:
+                        continue
+                    if not (_other.box.y2 > _pb.y and _other.box.y < _pb.y2):
+                        continue  # y 不重叠
+                    if _other.box.x >= _pb.x - 0.5:
+                        continue  # 不在左侧
+                    _ou = getattr(_other, "unicode", None) or ""
+                    _ou = _ou.lstrip("\n").lstrip()
+                    # 其他段落以 bullet 开头（`?` 单独/bullet 字符）即视为列表项，
+                    # 当前段落为其续行不缩进。图235 的 bullet 段（para87）unicode
+                    # 就是纯 `?`（无后随空格），故此处不要求 `?` 后跟空格。
+                    if _ou and (
+                        BULLET_POINT_PATTERN.match(_ou[0]) or _ou[0] == "?"
+                    ):
+                        _is_list_item = True
+                        break
+            if not _is_list_item:
+                current_x += space_width * 4
         # 预计算每个位置到下一个可换行点（不含该断点）的累计宽度，把原 O(n²) 的
         # _get_width_before_next_break_point(typesetting_units[i:]) 降为 O(n)。
         # 从后往前：width_to_next_break[i] = 从 i 开始累加 unit.width 直到（不含）

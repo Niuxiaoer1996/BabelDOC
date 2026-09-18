@@ -56,6 +56,9 @@ _PLAIN_INLINE_CHAR_RE = re.compile(r"[0-9+\]\[=]")
 # 上下标的基线 y 偏移阈值（pt）。同字号但抬高/降低的上下标（如 m⁻¹ 中的 ⁻，字号比
 # 0.79 临界漏判）用基线偏移识别。同一行普通文本 char.box.y 完全相同（0 偏移），故安全。
 _CORNER_Y_RAISE_PT = 2.0
+# 分式内部允许并入公式的数学符号（普通字体）：分子/分母被这些符号拆成独立公式时，
+# 合并垂直分式需把夹在分子/分母之间的此类符号文本一并并入公式（relocate 保留其 rel_y）。
+_FRACTION_SYMBOL_RE = re.compile(r"^[\\(\)\.\,\%\=\+\-\:\;×÷]$")
 from babeldoc.format.pdf.document_il.utils.spatial_analyzer import (
     is_element_contained_in_formula,
 )
@@ -393,14 +396,29 @@ class StylesAndFormulas:
         if not self.translation_config.ocr_workaround:
             self.collect_contained_elements(page)
 
-        # Process remaining non-formula lines after formula assignment is complete
-        if self.translation_config.remove_non_formula_lines:
-            self.remove_non_formula_lines_from_paragraphs(page)
-
         if not self.translation_config.skip_formula_offset_calculation:
             self.process_page_offsets(page)
         self.update_all_formula_data(page)
         self.process_page_styles(page)
+        # 垂直分式合并需在 process_page_styles 之后执行：此时 `=`/`(`/`)`/`.`/`%`
+        # 等符号已被拆成 TEXT composition（此前为 EMPTY 占位），可并入合并公式。
+        # 合并也放在 process_page_offsets 之后，以便 _merge_vertical_fractions 内
+        # 设置的 y_offset（使分式垂直居中）不被 process_page_offsets 覆盖。
+        # 先清理公式中的孤立空格：分式分子下方常有一个 y 位置异常（远离主字符行）
+        # 的空格（如 Page 408 分子 box 被撑高到 21.9），会污染公式 box 高度，使
+        # _merge_vertical_fractions 的 _is_vertical_fraction_pair 误判分子分母为同行。
+        self._remove_orphan_spaces(page)
+        self._merge_vertical_fractions(page)
+        self.update_all_formula_data(page)
+
+        # 处理剩余非公式线条：必须放在 _merge_vertical_fractions 之后。
+        # 分式分数线（y≈581 的细长水平曲线）位于合并前分子/分母两个独立公式之间的
+        # 空隙，collect_contained_elements 无法把它分配到任一公式，仍残留在
+        # page.pdf_curve。若在此前执行 remove_non_formula_lines，会把它当作
+        # "非公式线条"误删，导致译文中分式缺分数线。合并成一个公式后，分数线已
+        # 被收进 merged.pdf_curve，这里再清理真正残留的非公式线条就不会误删。
+        if self.translation_config.remove_non_formula_lines:
+            self.remove_non_formula_lines_from_paragraphs(page)
 
     def update_line_data(self, line: PdfLine):
         min_x = min(char.visual_bbox.box.x for char in line.pdf_character)
@@ -1155,6 +1173,460 @@ class StylesAndFormulas:
         merged_formula = PdfFormula(pdf_character=all_chars, line_id=formula1.line_id)
         self.update_formula_data(merged_formula)
         return merged_formula
+
+    def _remove_orphan_spaces(self, page: Page):
+        """移除公式中的孤立空格，避免污染公式 box 高度。
+
+        分式（分子/分母）内部偶有一个 y 位置异常的空格（如 Page 408 分子下方
+        y=370.7 的空格，与主字符中心差约 16pt），它把公式 box 高度撑大（21.9），
+        使 _is_vertical_fraction_pair 误判分子分母为"同行"而放弃合并。
+
+        规则：对每个公式，取所有非空格字符的 y 中心（主字符行），移除那些
+        y 中心与主字符行差 > 阈值（默认 6pt）的空格字符。行内正常空格
+        （y 与主字符一致）保留。
+        """
+        if not page.pdf_paragraph:
+            return
+        for paragraph in page.pdf_paragraph:
+            for comp in paragraph.pdf_paragraph_composition:
+                formula = comp.pdf_formula
+                if formula is None or formula.pdf_character is None:
+                    continue
+                chars = formula.pdf_character
+                # 收集非空格字符的 y 中心
+                non_space_cy = []
+                for ch in chars:
+                    u = ch.char_unicode
+                    if u is not None and u.isspace():
+                        continue
+                    b = ch.visual_bbox.box if ch.visual_bbox else ch.box
+                    if b is None:
+                        continue
+                    non_space_cy.append((b.y + b.y2) / 2)
+                if not non_space_cy:
+                    continue
+                main_cy = sum(non_space_cy) / len(non_space_cy)
+                removed = 0
+                kept = []
+                for ch in chars:
+                    u = ch.char_unicode
+                    if u is not None and u.isspace():
+                        b = ch.visual_bbox.box if ch.visual_bbox else ch.box
+                        cy = (b.y + b.y2) / 2 if b else main_cy
+                        if abs(cy - main_cy) > 6.0:
+                            removed += 1
+                            continue  # 孤立空格：移除
+                    kept.append(ch)
+                if removed:
+                    formula.pdf_character = kept
+                    if kept:
+                        self.update_formula_data(formula)
+
+    def _is_fraction_symbol_text(self, comp: PdfParagraphComposition) -> bool:
+        """判断 composition 是否为纯分式符号文本（`(`/`)`/`.`/`=` 等），可并入分式公式。
+
+        仅当所有非空白字符都是分式符号白名单成员、且无公式时返回 True。
+        空白（分子/分母间的空格）跳过，不影响判定。
+        """
+        if comp.pdf_formula is not None:
+            return False
+        ssc = comp.pdf_same_style_characters
+        if not ssc or not ssc.pdf_character:
+            return False
+        has_symbol = False
+        for ch in ssc.pdf_character:
+            u = ch.char_unicode
+            if u is None:
+                continue
+            if u.isspace():
+                continue
+            if not _FRACTION_SYMBOL_RE.match(u):
+                return False
+            has_symbol = True
+        return has_symbol
+
+    def _is_vertical_fraction_pair(
+        self, formula1: PdfFormula, formula2: PdfFormula
+    ) -> bool:
+        """判断两个公式是否为垂直分式：x 轴重叠、y 轴垂直相邻（一个在上一个在下）。
+
+        分式分子/分母（如 WCK(1.66m66)/WCK200ns）垂直排列：x 中心对齐、y 相距约一行。
+        同行公式中心 y 差 ≈ 0，不满足"垂直相邻"；相隔多行的公式中心 y 差过大，也不满足。
+        """
+        b1, b2 = formula1.box, formula2.box
+        if b1 is None or b2 is None:
+            return False
+        # x 轴有重叠（分子/分母中心大致对齐）
+        if b1.x2 < b2.x - 1 or b2.x2 < b1.x - 1:
+            return False
+        # 中心 y 差：垂直相邻（约一行高），而非同行（≈0）或相隔过远
+        cy1 = (b1.y + b1.y2) / 2
+        cy2 = (b2.y + b2.y2) / 2
+        y_diff = abs(cy1 - cy2)
+        avg_h = (b1.y2 - b1.y + b2.y2 - b2.y) / 2
+        if avg_h <= 0:
+            return False
+        return 0.5 * avg_h <= y_diff <= 2.5 * avg_h
+
+    def _merge_vertical_fractions(self, page: Page):
+        """把垂直排列的分式（分子/分母公式 + 中间的符号文本）合并成一个 PdfFormula。
+
+        背景：分式分子/分母（数学字体）被普通字体的 `=`/`(`/`)`/`.` 拆成多个独立公式，
+        relocate 时各公式水平排列导致塌陷。这里把"垂直相邻的分子公式 + 符号文本 + 分母公式"
+        的所有字符合并成一个公式，relocate 会用各字符 rel_y 保留垂直位置，分式不塌陷。
+        """
+        if not page.pdf_paragraph:
+            return
+        for paragraph in page.pdf_paragraph:
+            comps = paragraph.pdf_paragraph_composition
+            if not comps:
+                continue
+            i = 0
+            while i < len(comps):
+                comp1 = comps[i]
+                if comp1.pdf_formula is None:
+                    i += 1
+                    continue
+                formula1 = comp1.pdf_formula
+                # 向后找垂直相邻的分母公式，中间只允许公式/分式符号文本。
+                # 方案B（Page 408）：composition 顺序并非阅读顺序（行内 x 排序被禁用），
+                # 分式分子常被排在文本前、分母排在文本后（如 `tWCKosc(T) : ... = `
+                # 位于 x=112，分子 x=250、分母 x=252）。若中间夹着"与分子无 x 重叠"
+                # 的普通文本（几何上在分式侧面，非分子/分母所在列），应跳过它继续找
+                # 分母，而不是直接 BREAK。分子与分母的 x 重叠 + 垂直相邻由
+                # _is_vertical_fraction_pair 把关，不会误并无关公式。
+                j = i + 1
+                end = None
+                skipped_text = []  # 被跳过的侧面普通文本索引（合并时须保留，不并入分式）
+                while j < len(comps):
+                    compj = comps[j]
+                    if compj.pdf_formula is not None:
+                        _is_pair = self._is_vertical_fraction_pair(
+                            formula1, compj.pdf_formula
+                        )
+                        if _is_pair:
+                            end = j
+                            break
+                    elif not self._is_fraction_symbol_text(compj):
+                        # 空占位 composition（符号字符尚未被 styles 拆出）跳过；
+                        # 有实际文本字符的普通文本则视为分式结束
+                        ssc = compj.pdf_same_style_characters
+                        if not (ssc and ssc.pdf_character):
+                            j += 1
+                            continue
+                        # 方案B：若该普通文本与分子 box 无 x 重叠（在分式侧面，如
+                        # `tWCKosc(T)` 位于分子左侧），跳过它继续找分母；记录其索引
+                        # 以便合并时保留（不并入分式）。若与分子 x 重叠（同列/相邻），
+                        # 视为真正阻断分式的文本，BREAK 结束扫描。
+                        _ssc_box = ssc.box
+                        _skip = (
+                            formula1.box is not None
+                            and _ssc_box is not None
+                            and not self.is_x_axis_contained(formula1.box, _ssc_box)
+                            and not self.is_x_axis_adjacent(_ssc_box, formula1.box, 0.0)
+                        )
+                        if _skip:
+                            skipped_text.append(j)
+                            j += 1
+                            continue
+                        # 遇到普通文本，不是分式
+                        break
+                    j += 1
+                if end is not None:
+                    # 合并分子(comp[i])与分母(comp[end]) 的公式字符 + 与分子同一 x 列
+                    # 的中间分式符号文本（如 `=`/`(`/`)`），并保留被合并公式的曲线
+                    # （分数线）和 form（collect_contained_elements 已把分数线 curve
+                    # 关联到分子/分母公式的 pdf_curve，必须一并保留）。
+                    # 方案B：被跳过的侧面普通文本（skipped_text）不并入分式、保留原样。
+                    # 方案B-2：中间的**非分子非分母**成分（无论公式还是文本符号）只有
+                    #   与分子同一 x 列（x 重叠或紧邻）才并入分式。否则会误并入侧面
+                    #   文本的公式（如 Page 408 的 `MWCW OMM`(comp6)/`T`(comp8)/`:`），
+                    #   使合并 box 向左延伸、把 `tWCKosc(T) :` 吞进公式导致错位。
+                    _mb = formula1.box
+                    # 分式列 = 分子与分母 x 的并集范围（407 的 `= value` 常在分子
+                    # 右侧、仍属分式；408 的侧面文本 `MWCW OMM` 在分式列远处）。
+                    _col = None
+                    if _mb is not None:
+                        _db = (
+                            comps[end].pdf_formula.box
+                            if comps[end].pdf_formula is not None
+                            else None
+                        )
+                        if _db is not None:
+                            _col = Box(
+                                x=min(_mb.x, _db.x),
+                                y=min(_mb.y, _db.y),
+                                x2=max(_mb.x2, _db.x2),
+                                y2=max(_mb.y2, _db.y2),
+                            )
+                        else:
+                            _col = _mb
+                    all_chars = []
+                    all_curves = []
+                    all_forms = []
+                    # 记录真正并入分式的中间索引（合并后这些 comp 会被删除，
+                    # 但被跳过的侧面文本/未被并入的中间成分须保留）。
+                    merged_side = set()
+                    for k in range(i, end + 1):
+                        if k in skipped_text:
+                            continue
+                        compk = comps[k]
+                        if k != i and k != end:
+                            # 中间成分：仅在"分子∪分母"的分式列内才并入分式
+                            _cb = (
+                                compk.pdf_formula.box
+                                if compk.pdf_formula is not None
+                                else (
+                                    compk.pdf_same_style_characters.box
+                                    if compk.pdf_same_style_characters is not None
+                                    else None
+                                )
+                            )
+                            if (
+                                _col is None
+                                or _cb is None
+                                or (
+                                    not self.is_x_axis_contained(_cb, _col)
+                                    and not self.is_x_axis_adjacent(_cb, _col, 0.0)
+                                )
+                            ):
+                                continue
+                            merged_side.add(k)
+                        if compk.pdf_formula is not None:
+                            all_chars.extend(compk.pdf_formula.pdf_character)
+                            all_curves.extend(compk.pdf_formula.pdf_curve)
+                            all_forms.extend(compk.pdf_formula.pdf_form)
+                        elif compk.pdf_same_style_characters:
+                            all_chars.extend(
+                                compk.pdf_same_style_characters.pdf_character
+                            )
+                    if all_chars:
+                        merged = PdfFormula(
+                            pdf_character=all_chars, line_id=formula1.line_id
+                        )
+                        merged.pdf_curve = all_curves
+                        merged.pdf_form = all_forms
+                        self.update_formula_data(merged)
+                        # 收集 page.pdf_curve 中被合并分式 box 包含的曲线（分数线）。
+                        # collect_contained_elements 在合并前运行时，分子/分母还是独立公式，
+                        # 分数线曲线位于两者之间的空隙、与任一公式的 IoU 都为 0，因而未被
+                        # 分配到任何公式，仍残留在 page.pdf_curve。合并成一个公式后，把被
+                        # merged.box 包含的曲线收进 merged.pdf_curve，使分数线随分式一起
+                        # relocate（含 y_offset 垂直居中），避免与分子分母错位。
+                        # 注意不能用 is_element_contained_in_formula（按 IoU 判断）：分数线
+                        # 曲线面积远小于公式面积，IoU 极低永远不达标。这里用带容差的
+                        # 完全包含判断（曲线 box 整体落在公式 box 内）。
+                        if page.pdf_curve and merged.box is not None:
+                            _tol = 2.0
+                            _mb = merged.box
+                            for crv in list(page.pdf_curve):
+                                if not crv.box:
+                                    continue
+                                _cb = crv.box
+                                # 分数线：y 与分式重叠（位于分子/分母之间）、x 与分式
+                                # 大致对齐。注意分数线常比合并后的分式 box 略宽（如
+                                # Page 407 分数线 x2=430.3，而合并 box x2=421.4），
+                                # 因此不能要求完全包含；只要 y 重叠 + x 有交集即可，
+                                # 收集后扩展 merged.box 以包含该分数线。
+                                if not (
+                                    _cb.y >= _mb.y - _tol
+                                    and _cb.y2 <= _mb.y2 + _tol
+                                    and _cb.x <= _mb.x2 + _tol
+                                    and _cb.x2 >= _mb.x - _tol
+                                ):
+                                    continue
+                                merged.pdf_curve.append(crv)
+                                page.pdf_curve.remove(crv)
+                                # 扩展 merged.box 以包含分数线
+                                if _cb.x < _mb.x or _cb.x2 > _mb.x2:
+                                    _mb = Box(
+                                        x=min(_mb.x, _cb.x),
+                                        y=_mb.y,
+                                        x2=max(_mb.x2, _cb.x2),
+                                        y2=_mb.y2,
+                                    )
+                                    merged.box = _mb
+                        # 分式所在行是否含"可翻译字母文本"（如 Page 408 的 `tWCKosc(T)`）：
+                        # 若含，分式不能做等号左右合并（避免吞可翻译文本），且 y_offset 应
+                        # 让分式中心与同行文本中心对齐（而非 -半高 对齐 current_y，否则
+                        # 分式相对文本偏下）；Page 407 分式行无字母文本，用 -半高。
+                        _row_has_letter = False
+                        _row_text_box = None
+                        if merged.box is not None:
+                            # 选"中心 y 最接近分式中心、且含实际字母文本"的对齐基准
+                            # （如 Page 408 的 `tWCKosc(T)`），避免误选中 `_`/bullet `?  `
+                            # 等边缘字符导致分式 y_offset 算错、与文本错位。
+                            _frac_cy = (merged.box.y + merged.box.y2) / 2
+                            _best_dist = None
+                            for _ck in comps:
+                                _ssc = _ck.pdf_same_style_characters
+                                if _ssc is None:
+                                    continue
+                                if self._is_fraction_symbol_text(_ck):
+                                    continue
+                                # 排除以空格/bullet 为主的文本（如 `?  `），只选
+                                # 含真实字母的文本作为垂直对齐基准。
+                                _letters = sum(
+                                    1
+                                    for _ch in _ssc.pdf_character or []
+                                    if (_ch.char_unicode or "").isalnum()
+                                )
+                                if not _letters:
+                                    continue
+                                if _ssc.box is None or not self.has_y_intersection(
+                                    _ssc.box, merged.box
+                                ):
+                                    continue
+                                _tc = (_ssc.box.y + _ssc.box.y2) / 2
+                                _d = abs(_tc - _frac_cy)
+                                if _best_dist is None or _d < _best_dist:
+                                    _best_dist = _d
+                                    _row_has_letter = True
+                                    _row_text_box = _ssc.box
+                        if merged.box is None:
+                            merged.y_offset = 0
+                        elif _row_has_letter and _row_text_box is not None:
+                            # 让分式中心 = 同行文本中心：
+                            # current_y + 分式半高 + yoff = current_y + 文本半高
+                            # → yoff = 文本半高 - 分式半高 = (h_text - h_frac)/2
+                            _h_frac = merged.box.y2 - merged.box.y
+                            _h_text = _row_text_box.y2 - _row_text_box.y
+                            merged.y_offset = (_h_text - _h_frac) / 2
+                        else:
+                            # 让合并分式垂直居中：relocate 用 formula.box.y（分母位置）
+                            # 作为 rel_y 基准，导致分子 rel_y 大、被推到文本行上方。
+                            # 把 box 中心对齐锚点（y_offset = -半高），使分子/分母对称居中。
+                            merged.y_offset = -(merged.box.y2 - merged.box.y) / 2
+                        # 用合并公式替换 comp[i]；删除分母(comp[end]) + 真正并入分式的
+                        # 中间成分(merged_side)。保留被跳过的侧面普通文本（skipped_text，
+                        # 如 `tWCKosc(T)`），也保留未被并入的侧面公式（如 `MWCW OMM`/`T`），
+                        # 否则会把 `tWCKosc(T) : MWCW OMM(T)` 误删导致文本错位。
+                        comps[i] = PdfParagraphComposition(pdf_formula=merged)
+                        _to_remove = {end} | merged_side
+                        for _k in sorted(_to_remove, reverse=True):
+                            del comps[_k]
+                        # 方案B-3：合并分式后按 x 坐标重排到正确位置。
+                        # composition 顺序并非阅读顺序（行内 x 排序被禁用），分式分子
+                        # 常被排在最前、分母在最后、中间隔文本。合并后分式继承了分子的
+                        # 最前位置，导致译文里分式跑到行首（如 Page 408 的 `tWCKosc(T)
+                        # : ... = [Run Time/2*Count]`，分式 x=250 却排第 1）。
+                        # 这里把合并分式插到"最后一个 x2 <= 分式.x 的 comp"之后，
+                        # 恢复阅读顺序（文本在左、分式在右）。对 Page 407（分式已在
+                        # 正确位置）无变化。
+                        if merged.box is not None:
+                            _frac_comp = PdfParagraphComposition(pdf_formula=merged)
+                            del comps[i]
+                            _insert = -1
+                            _fx = merged.box.x
+                            for _k, _ck in enumerate(comps):
+                                _cb = (
+                                    _ck.pdf_formula.box
+                                    if _ck.pdf_formula is not None
+                                    else (
+                                        _ck.pdf_same_style_characters.box
+                                        if _ck.pdf_same_style_characters is not None
+                                        else None
+                                    )
+                                )
+                                if _cb is not None and _cb.x2 <= _fx + 0.5:
+                                    _insert = _k
+                            comps.insert(_insert + 1, _frac_comp)
+                            i = _insert + 1
+                        # 方案B-4：分式所在行若含"可翻译字母文本"（如 Page 408 的
+                        # `tWCKosc(T)`，前面计算 _row_has_letter），不做等号左右合并——
+                        # 否则会把 `MWCW OMM(T)` 等可翻译内容吞进分式公式、丢失翻译。
+                        # Page 407 的分式行只有公式 + 纯分式符号文本（无字母），照常合并。
+                        # 合并同行等号前后的公式+符号成一个整体（像分式一样），统一 y_offset。
+                        # 等号前后行的内容由公式（comp0/4/6）和普通文本符号（`=`/`.`/`%`）
+                        # 混排而成：分式合并后分式 box 中心对齐 current_y（y_offset=-半高），
+                        # 但等号前后的公式和文本符号各自为独立 composition，文本符号没有
+                        # y_offset、不跟随公式下移，导致它们相对分式偏上、互相错位。
+                        # 这里把分式左右两侧同行（y 区间与分式重叠）的连续"公式 + 文本符号"
+                        # 分别合并成一个 PdfFormula，并统一 y_offset=-(height/2)，
+                        # 使整行内容的 box 中心都对齐 current_y，一起下移。
+                        if merged.box is not None and not _row_has_letter:
+                            try:
+                                for _side, _start, _step in (
+                                    ("left", i - 1, -1),
+                                    ("right", i + 1, 1),
+                                ):
+                                    _chars = []
+                                    _k = _start
+                                    _first = _k
+                                    while 0 <= _k < len(comps):
+                                        _ck = comps[_k]
+                                        _box = None
+                                        _chs = []
+                                        if _ck.pdf_formula is not None:
+                                            _box = _ck.pdf_formula.box
+                                            _chs = list(
+                                                _ck.pdf_formula.pdf_character
+                                            )
+                                        elif _ck.pdf_same_style_characters:
+                                            _box = _ck.pdf_same_style_characters.box
+                                            # 方案B 防护：分式侧面的**含字母普通文本**
+                                            # （如 `tWCKosc(T)` 位于分式左侧 x=112）不应被
+                                            # 并入分式公式，仅当其与分式 x 轴重叠或紧邻
+                                            # （同一分式行的等号/数值）时才并入。
+                                            # 纯分式符号文本（`=`/`(`/`)`/`.`/`%`，Page 407
+                                            # 的等号前后）**始终并入**：它们就是分式等号，
+                                            # 且必须与分式一起设 y_offset=-半高 才能整体
+                                            # 垂直居中（否则分式与等号前后内容错位偏上）。
+                                            if not self._is_fraction_symbol_text(_ck) and (
+                                                _box is None
+                                                or (
+                                                    not self.is_x_axis_contained(
+                                                        _box, merged.box
+                                                    )
+                                                    and not self.is_x_axis_adjacent(
+                                                        _box, merged.box, 3.0
+                                                    )
+                                                )
+                                            ):
+                                                break
+                                            _chs = list(
+                                                _ck.pdf_same_style_characters.pdf_character
+                                            )
+                                        else:
+                                            break
+                                        if (
+                                            _box is None
+                                            or not self.has_y_intersection(
+                                                _box, merged.box
+                                            )
+                                        ):
+                                            break  # 不同行，停止
+                                        _chars.extend(_chs)
+                                        _k += _step
+                                    if _chars:
+                                        _sm = PdfFormula(
+                                            pdf_character=_chars,
+                                            line_id=merged.line_id,
+                                        )
+                                        self.update_formula_data(_sm)
+                                        _sm.y_offset = (
+                                            -(_sm.box.y2 - _sm.box.y) / 2
+                                            if _sm.box is not None
+                                            else 0
+                                        )
+                                        _new_comp = PdfParagraphComposition(
+                                            pdf_formula=_sm
+                                        )
+                                        if _side == "left":
+                                            # 替换 _first..i-1 为单个合并公式
+                                            del comps[_first:i]
+                                            comps.insert(_first, _new_comp)
+                                            # 分式索引左移
+                                            i = _first + 1
+                                        else:
+                                            # 替换 i+1.._k-1 为单个合并公式
+                                            del comps[i + 1 : _k]
+                                            comps.insert(i + 1, _new_comp)
+                            except Exception:
+                                pass
+                        # 继续从 i 检查是否还有可合并的分式
+                        continue
+                i += 1
 
     def is_x_axis_contained(self, box1: Box, box2: Box) -> bool:
         """判断 box1 的 x 轴是否完全包含在 box2 的 x 轴内，或反之"""
