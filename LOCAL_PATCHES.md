@@ -1231,3 +1231,32 @@
   此分支；不影响 407。
 - **上游价值**: bullet 与正文同段时正文列丢失属上游普适问题，可考虑提 PR。
 
+## 49. 上标 y_offset 被孤立空格污染，导致 `16` 上标位置错乱（2026-09-19，JESD209-5B Page 407）
+
+- **Commit**: `111ff85`（分支 `fix/p407-superscript-regression`，未 push）
+- **症状**: Page 407 最后一行第一个 `2^16` 的 `16` 本是 `2` 的上标，但渲染后 `16` 跑到 `2` 的**下方
+  且更远**（往下掉约 13pt）。**是公式位置修正（补丁47）之后才出现的回归**，最初版正常。
+- **定位/根因**: `2^16` 上标公式里混入一个 y 位置异常、远离主字符行的孤立空格，把公式 box 顶部
+  撑高到 20.3pt。`process_page_offsets` 用这个被污染的 box 计算 `y_offset` 得 -13.45，导致上标
+  `16` 渲染时往下掉 13pt、错位。之前 `_remove_orphan_spaces` 只在 `_merge_vertical_fractions` 前执行
+  （`process_page_offsets` 之后），未覆盖 `process_page_offsets` 自身用的 box。
+- **修复**（`styles_and_formulas.py::process_page`）: 把 `_remove_orphan_spaces` **提前到
+  `process_page_offsets` 之前**执行——先清孤立空格让 box 恢复真实高度，`process_page_offsets` 才能算出
+  正确的 `y_offset`（+2.47）。`_merge_vertical_fractions` 前仍保留一次清理（幂等），避免污染分式 box
+  高度、使 `_is_vertical_fraction_pair` 误判分子分母为同行。
+- **验证**: 用户重跑确认 `16` 上标恢复正常（不再下掉 13pt）。
+- **上游价值**: 孤立空格污染公式 box 高度影响 `process_page_offsets` 的 y_offset 计算，属上游普适
+  缺陷，可考虑提 PR。
+
+## 50. LLM 在公式占位符前补文本 `^`，导致 `2^16` 渲染成 `2^^16`（双 `^`）（2026-09-19，JESD209-5B Page 407）
+
+- **Commit**: `9bb7192`（分支 `fix/p407-superscript-regression`，未 push）
+- **症状**: Page 407 的 `2^16` 渲染成 `2^^16`（双 `^`）。**从最开始就有**（与公式位置修正无关）。
+- **定位/根因**: 源中 `^`（幂记号，如 `2^16`）常被识别为公式，翻译时替换成占位符 `{vN}`；LLM 常在
+  占位符前补一个文本 `^`（输出 `2^{vN}16`）。占位符回填后变成"文本 `^` + 公式 `^`" = `2^^16`（双 `^`）。
+- **修复**（`il_translator.py::post_translate_paragraph` 清理循环新增第 5 条规则）: 检测"文本 comp 以
+  `^` 结尾 + 下一 comp 是单个 `^` 的公式"，则移除文本 `^`（若文本 `^` 前无内容则直接删该 comp）。
+- **验证**: 用户重跑确认 `2^16` 不再变成 `2^^16`。
+- **上游价值**: LLM 对幂记号占位符前补 `^` 导致双 `^`，属上游普适缺陷（任何含幂记号的文档），可考虑
+  提 PR。
+
