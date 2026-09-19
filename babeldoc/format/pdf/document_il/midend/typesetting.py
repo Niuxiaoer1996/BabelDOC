@@ -22,6 +22,7 @@ from babeldoc.format.pdf.document_il import PdfStyle
 from babeldoc.format.pdf.document_il import il_version_1
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.utils.formular_helper import update_formula_data
+from babeldoc.format.pdf.document_il.utils.layout_helper import BULLET_POINT_PATTERN
 from babeldoc.format.pdf.document_il.utils.layout_helper import box_to_tuple
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
@@ -1110,6 +1111,7 @@ class Typesetting:
                     paragraph,
                     use_english_line_break,
                     table_barriers,
+                    page,
                 )
 
                 # 如果所有单元都放得下
@@ -1488,6 +1490,7 @@ class Typesetting:
         paragraph: il_version_1.PdfParagraph,
         use_english_line_break: bool = True,
         table_barriers: list[Box] | None = None,
+        page: il_version_1.Page | None = None,
     ) -> tuple[list[TypesettingUnit], bool]:
         """布局排版单元。
 
@@ -1544,8 +1547,78 @@ class Typesetting:
         all_units_fit = True
         last_unit: TypesettingUnit | None = None
         line_ys = [current_y]
+        _is_list_item = False
+        # 段落是否以 bullet 字符开头（`•` 等，列表项）。注意：即便该段落
+        # first_line_indent=False（如 Page 408 图236 的 `Hxfq8`），只要首字符是
+        # bullet、且 bullet 与正文在同一段落，也需要做正文列对齐（恢复 bullet→正文
+        # 留白），故此处无条件计算。
+        _list_has_bullet_first = bool(
+            typesetting_units
+            and typesetting_units[0].try_get_unicode()
+            and BULLET_POINT_PATTERN.match(
+                typesetting_units[0].try_get_unicode()
+            )
+        )
+        _list_content_x: float | None = None
+        _passed_bullet = False
+        if _list_has_bullet_first:
+            # 列表项正文列：bullet 与正文在同一段落时（如 Page 408 图236 的
+            # `LfiF1`/`Hxfq8`，box 从 bullet x=92 起、正文在 x=112），排版会把正文
+            # 紧贴 bullet（仅 2 空格宽）排到 x≈98，而原文正文在 x=112（bullet 后
+            # 约 16pt 留白）。注意正文是 unicode unit（box=0，拿不到源正文列），
+            # 但 bullet 是 char unit（box 正确）。故正文列 = box.x（bullet 起点）
+            # + bullet 实际宽度 + 一个标准列表缩进（4 个空格宽）。bullet 宽度≈1
+            # 空格宽，故整体 ≈ bullet 后 5 空格，对齐到原文正文列附近。
+            # （图235 的正文是独立段落、box 本身从 x=112 起，走不到此分支。）
+            _bullet_width = 0.0
+            if typesetting_units[0].box is not None:
+                _bullet_width = typesetting_units[0].box.x2 - typesetting_units[0].box.x
+            _list_content_x = box.x + _bullet_width + space_width * 4
         if paragraph.first_line_indent and getattr(paragraph, "toc_role", None) != "title":
-            current_x += space_width * 4
+            # 列表项（段落以 bullet 字符开头，如 `•`/`?` 后跟空格）不应应用首行缩进，
+            # 否则整个列表项（含 bullet 和后续文字/公式）会整体右移，与原文不对齐
+            # （Page 408 图235/图236 下方无序列表因此偏右；图235 文字右移还导致
+            # 分式放不下而换行退到下一行开头）。
+            _is_list_item = bool(
+                typesetting_units
+                and typesetting_units[0].try_get_unicode()
+                and (
+                    BULLET_POINT_PATTERN.match(
+                        typesetting_units[0].try_get_unicode()
+                    )
+                    or (
+                        typesetting_units[0].try_get_unicode() == "?"
+                        and len(typesetting_units) > 1
+                        and typesetting_units[1].try_get_unicode() == " "
+                    )
+                )
+            )
+            # 列表项续行：当前段落不是以 bullet 开头，但同一 y 带左侧有一个以 bullet
+            # 开头的段落（如 Page 408 图235 的列表项2 被拆成 para87 bullet + para88
+            # 文本/分式两个段落）。此类续行同样不应首行缩进。
+            if not _is_list_item and paragraph.box is not None:
+                _pb = paragraph.box
+                for _other in page.pdf_paragraph:
+                    if _other is paragraph or _other.box is None:
+                        continue
+                    if not (_other.box.y2 > _pb.y and _other.box.y < _pb.y2):
+                        continue  # y 不重叠
+                    if _other.box.x >= _pb.x - 0.5:
+                        continue  # 不在左侧
+                    _ou = getattr(_other, "unicode", None) or ""
+                    _ou = _ou.lstrip("\n").lstrip()
+                    # 其他段落以 bullet 开头（`?` 单独/bullet 字符）即视为列表项，
+                    # 当前段落为其续行不缩进。图235 的 bullet 段（para87）unicode
+                    # 就是纯 `?`（无后随空格），故此处不要求 `?` 后跟空格。
+                    if _ou and (
+                        BULLET_POINT_PATTERN.match(_ou[0]) or _ou[0] == "?"
+                    ):
+                        _is_list_item = True
+                        break
+            if not _is_list_item:
+                current_x += space_width * 4
+            # 若是列表项则不缩进（_is_list_item=True 时 current_x 保持 box.x）。
+            # 正文列对齐由上面无条件计算的 _list_content_x 在排版循环里处理。
         # 预计算每个位置到下一个可换行点（不含该断点）的累计宽度，把原 O(n²) 的
         # _get_width_before_next_break_point(typesetting_units[i:]) 降为 O(n)。
         # 从后往前：width_to_next_break[i] = 从 i 开始累加 unit.width 直到（不含）
@@ -1659,6 +1732,18 @@ class Typesetting:
                 if unit.is_space:
                     line_height = max(line_height, unit_height)
                     continue
+
+            # 列表项正文列对齐：bullet 后的正文对齐到计算出的正文列（恢复
+            # bullet→正文留白）。例：Page 408 图236 的 `LfiF1`/`Hxfq8` box 从
+            # bullet(x=92) 起、正文在 x=112，排版若不处理会把正文紧贴 bullet 排到
+            # x≈98；这里把 bullet 后第一个非空格字符对齐到正文列。
+            if _list_content_x is not None:
+                if i == 0:
+                    _passed_bullet = True
+                elif _passed_bullet and not unit.is_space:
+                    if current_x < _list_content_x:
+                        current_x = _list_content_x
+                    _passed_bullet = False
 
             # 放置当前单元
             relocated_unit = unit.relocate(current_x, current_y, scale)
