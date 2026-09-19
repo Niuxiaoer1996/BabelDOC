@@ -1110,7 +1110,7 @@
 
 ## 45. 上下标方向丢失 + 无序列表/参数行合并（2026-09-16，JESD209 拆分 429-439 页）
 
-- **Commit**: （待提交）
+- **Commit**: `2402508`
 - **症状（JESD209-5B-HJ，`-p 429-439 --split --debug`）**:
   1. **上下标方向丢失**：原文 `VREF` 的 `REF`、`MR16 OP[6]=1B/0B` 的 `B` 是**下标**
      （baseline 比主字符低 ~1pt），译文渲染成**上标**（Page 401/402/405）。
@@ -1165,4 +1165,69 @@
 - **验证**: `import babeldoc.format.pdf.new_parser.pymupdf_page_view_access` 等模块
   导入干净，无弃用警告
 - **上游价值**: 属上游普适问题，pymupdf 官方早已建议用 `import pymupdf`，可考虑提 PR
+
+## 47. 垂直分式合并 + 列表项跳过首行缩进（2026-09-19，JESD209-5B Page 407/408）
+
+- **Commit**: `62a7cee`（分支 `fix/p408-fraction-line-split`，未 push）
+- **症状**（JESD209-5B，`_split_JESD209-5B-HJ` 子集 page[0]=407/page[1]=408）:
+  1. **分式塌陷/拆开错位**：Page 407 的 Granularity 分式（数学字体分子/分母被 `=`/`(`/`)`/`.` 拆成
+     多个独立公式）水平排列塌陷；Page 408 图235/图236 列表项2 的分式（分子 `Run Time` + 分数线
+     被前置到行首、`tWCKosc(V)= ` 与分母 `2*Count` 留后）拆开错位。
+  2. **分数线丢失**：Page 407 分式合并后分数线曲线未收集，分式缺横线。
+  3. **分式垂直位置偏下/偏上**：分式与同行文本未按中心对齐。
+  4. **列表项整体偏右 / 整行消失**：Page 408 图235/图236 列表项以 bullet 开头，却应用了首行缩进
+     （`first_line_indent` 时 `current_x += space_width*4`，≈19pt）整体右移；图235 第二点（para88,
+     fallback_line）文本右移到 x=262 > 分式 box.x=249.8，分式换行占两行、current_y 超出 box 底部
+     → `all_units_fit=False` 排版失败 → `pdf_paragraph_composition=[]`、`optimal_scale=0.1`，
+     pdf_creater 报 "Unable to export paragraphs that have not yet been formatted"，整行消失。
+- **定位/根因**:
+  1. 分式拆开：布局模型把分式标 `plain text`，分子/分母数学字体被普通字体符号拆成多个独立公式，
+     生成 `{vN}` 后水平塌陷；Page 408 分子被排到 composition 最前、分母最后、中间隔 `tWCKosc` 文本
+     （非阅读顺序）。
+  2. 分数线丢失：`remove_non_formula_lines` 在 `_merge_vertical_fractions` 前执行，误删分数线曲线。
+  3. 位置偏下：`_row_text_box` 取到不含真实字母的文本（`_`/bullet `? `）作为分式 y 对齐基准。
+  4. 列表项偏右/整行消失：列表项（bullet 开头）不应应用 first_line_indent；续行判断用了
+     `page.pdf_paragraph` 但 `_layout_typesetting_units` **没有 `page` 参数** → 抛 NameError，
+     被 `_find_optimal_scale_and_layout` 的 try/except 静默捕获 → 排版异常失败（composition 空）。
+- **修复**:
+  1. 分式（`styles_and_formulas.py` 新增 `_merge_vertical_fractions`）：合并垂直相邻（x 重叠 + y 中心差
+     `0.5~2.5×avg_h`）的分子+分母成一个 `PdfFormula`，收集分数线曲线（`ncurve_final=1`）；
+     等号前后同行公式+符号**分别**合并成 2 个小公式（各自 `y_offset=-(height/2)`，box 中心对齐
+     current_y）；**方案B/B-2/B-3/B-4**（跳过与分子无 x 重叠的侧面文本找分母、只并入同 x 列中间成分、
+     合并后按 x 重排恢复阅读顺序、分式行含可翻译字母文本时跳过等号左右合并）；
+     `_remove_orphan_spaces` 清理公式中 y 异常孤立空格（避免误判分子分母同行）；
+     **顺序修复**：`remove_non_formula_lines` 移到 `_merge_vertical_fractions` 之后。
+  2. 垂直位置（`_row_text_box`）：选"中心最接近分式中心、且含真实字母的文本"（排除 `_`/bullet 等
+     边缘字符），`yoff = 文本半高 - 分式半高`，分式中心与同行文本中心对齐。
+  3. 列表项缩进（`typesetting.py::_layout_typesetting_units`）：列表项（首 unit 是 bullet 字符 /
+     列表项续行）跳过 first_line_indent；并修复 `_layout_typesetting_units` 缺 `page` 参数的
+     NameError（调用处 line 1106 补传 `page`）。
+- **验证**: 用户重跑 page407/408——Page 407 分式行与原文完全对齐（分子中心 202.6 / 分母中心 217.0）；
+  Page 408 图235 第二点正常显示、位置与原位一致；407 无回归。
+- **风险控制**: 方案B 的跨 composition 找分母仅跳过"与分子无 x 重叠"的侧面文本，且只并入同 x 列
+  中间成分，避免误吞 `tWCKosc(T) :` 等可翻译文本；等号左右合并加 x 重叠/紧邻防护；`_remove_orphan_spaces`
+  仅移除与主字符行 y 中心差 >6pt 的空格。
+- **上游价值**: 分式合并、列表项缩进豁免均属上游普适缺陷，可考虑提 PR。
+
+## 48. 列表项正文列对齐（bullet 与正文同一段落时恢复 bullet→正文留白）（2026-09-19，JESD209-5B Page 408 图236）
+
+- **Commit**: `a224e35`（分支 `fix/p408-fraction-line-split`，未 push）
+- **症状**: Page 408 图236 的两个列表项（`LfiF1`/`Hxfq8`，bullet 与正文**同一段落**，box 从 bullet
+  x=92 起、正文在 x=112）翻译后正文**紧贴 bullet** 排到 x≈98，丢失 bullet→正文约 16pt 留白，与原文
+  不对齐。图235 列表（bullet 是独立段落、正文独立段落 box 从 x=112 起）不受影响。
+- **定位/根因**: 翻译后正文变成 **unicode unit**（`pdf_same_style_unicode_characters`，`box.x=0`），
+  只有 bullet 是 char unit（`box.x=92`）。因此**不能依赖正文 unit 的 box** 计算正文列——正文 unit
+  box.x=0，无法直接取到源正文列 x=112。
+- **修复**（`typesetting.py::_layout_typesetting_units`）: 因正文 unicode unit 无源 box，改用 bullet
+  （char unit，box 正确）计算正文列：
+  - `_list_content_x = box.x(bullet 起点) + bullet 实际宽度 + space_width*4`（≈ bullet 后 5 空格，
+    对齐到源正文列附近）。
+  - `_list_has_bullet_first` **无条件计算**（不依赖 `first_line_indent`，因 `Hxfq8` firstind=False）。
+  - 排版循环里 bullet 后第一个非空格字符把 `current_x` snap 到 `_list_content_x`（`_passed_bullet`
+    标记）。
+- **验证**: 用户重跑 page408——图236 两个列表项正文位置与原文一致（输出 `tWCKosc(V)` 在 x≈114.6，
+  原文 112，视觉对齐），图235 和 407 正常。
+- **风险控制**: 仅在段落首 unit 是 bullet 字符时计算 `_list_content_x`；图235（正文独立段落）走不到
+  此分支；不影响 407。
+- **上游价值**: bullet 与正文同段时正文列丢失属上游普适问题，可考虑提 PR。
 
