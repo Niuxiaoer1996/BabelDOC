@@ -1326,6 +1326,23 @@ class ILTranslator:
                             if _comp_set_unicode(comps[i], merged):
                                 del comps[i + 1]
                             break
+            # 5) 双 `^` 清理：源中 `^`（幂记号，如 `2^16`）常被识别为公式、翻译时替换成
+            #    占位符 `{vN}`；LLM 常在占位符前补一个文本 `^`（输出 `2^{vN}16`），
+            #    占位符回填后变成"文本 `^` + 公式 `^`" = `2^^16`（双 `^`）。
+            #    若文本 comp 以 `^` 结尾、且下一 comp 是单个 `^` 的公式，则移除文本 `^`。
+            if i + 1 < len(comps):
+                u1 = _comp_unicode(comps[i]) or ""
+                u2 = _comp_unicode(comps[i + 1]) or ""
+                if (
+                    u1.endswith("^")
+                    and comps[i + 1].pdf_formula is not None
+                    and u2 == "^"
+                ):
+                    if u1[:-1] == "":
+                        del comps[i]
+                        continue
+                    if _comp_set_unicode(comps[i], u1[:-1]):
+                        continue
             i += 1
 
         # 最终确定性兜底：跨 composition 的度符号双写（如 "200 ◦℃与℃之间"、
