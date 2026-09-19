@@ -389,6 +389,12 @@ class StylesAndFormulas:
         # self.process_page_offsets(page)
         self.process_comma_formulas(page)
         self.merge_overlapping_formulas(page)
+        # 清理公式中的孤立空格需在 process_page_offsets 之前执行：孤立空格（如
+        # `2^16` 上标公式里混入的一个 y 位置异常、远离主字符行的空格，Page 407
+        # 的 `16 ` box 被撑高到 20.3）会污染公式 box 高度，使 process_page_offsets
+        # 用它算出的 y_offset 错误（如 `16` 上标被算成 -13.45，渲染时往下掉 13pt）。
+        # 先清空格让 box 恢复真实高度，process_page_offsets 才能算出正确的 y_offset。
+        self._remove_orphan_spaces(page)
         if not self.translation_config.skip_formula_offset_calculation:
             self.process_page_offsets(page)
         self.process_translatable_formulas(page)
@@ -404,9 +410,9 @@ class StylesAndFormulas:
         # 等符号已被拆成 TEXT composition（此前为 EMPTY 占位），可并入合并公式。
         # 合并也放在 process_page_offsets 之后，以便 _merge_vertical_fractions 内
         # 设置的 y_offset（使分式垂直居中）不被 process_page_offsets 覆盖。
-        # 先清理公式中的孤立空格：分式分子下方常有一个 y 位置异常（远离主字符行）
-        # 的空格（如 Page 408 分子 box 被撑高到 21.9），会污染公式 box 高度，使
-        # _merge_vertical_fractions 的 _is_vertical_fraction_pair 误判分子分母为同行。
+        # 这里再清一次孤立空格（幂等）：process_page_styles 之后若有新产生的孤立空格
+        # 仍会在 _merge_vertical_fractions 前被移除，避免污染分式 box 高度、使
+        # _is_vertical_fraction_pair 误判分子分母为同行。
         self._remove_orphan_spaces(page)
         self._merge_vertical_fractions(page)
         self.update_all_formula_data(page)
