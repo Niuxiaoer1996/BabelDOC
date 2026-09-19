@@ -1547,6 +1547,33 @@ class Typesetting:
         all_units_fit = True
         last_unit: TypesettingUnit | None = None
         line_ys = [current_y]
+        _is_list_item = False
+        # 段落是否以 bullet 字符开头（`•` 等，列表项）。注意：即便该段落
+        # first_line_indent=False（如 Page 408 图236 的 `Hxfq8`），只要首字符是
+        # bullet、且 bullet 与正文在同一段落，也需要做正文列对齐（恢复 bullet→正文
+        # 留白），故此处无条件计算。
+        _list_has_bullet_first = bool(
+            typesetting_units
+            and typesetting_units[0].try_get_unicode()
+            and BULLET_POINT_PATTERN.match(
+                typesetting_units[0].try_get_unicode()
+            )
+        )
+        _list_content_x: float | None = None
+        _passed_bullet = False
+        if _list_has_bullet_first:
+            # 列表项正文列：bullet 与正文在同一段落时（如 Page 408 图236 的
+            # `LfiF1`/`Hxfq8`，box 从 bullet x=92 起、正文在 x=112），排版会把正文
+            # 紧贴 bullet（仅 2 空格宽）排到 x≈98，而原文正文在 x=112（bullet 后
+            # 约 16pt 留白）。注意正文是 unicode unit（box=0，拿不到源正文列），
+            # 但 bullet 是 char unit（box 正确）。故正文列 = box.x（bullet 起点）
+            # + bullet 实际宽度 + 一个标准列表缩进（4 个空格宽）。bullet 宽度≈1
+            # 空格宽，故整体 ≈ bullet 后 5 空格，对齐到原文正文列附近。
+            # （图235 的正文是独立段落、box 本身从 x=112 起，走不到此分支。）
+            _bullet_width = 0.0
+            if typesetting_units[0].box is not None:
+                _bullet_width = typesetting_units[0].box.x2 - typesetting_units[0].box.x
+            _list_content_x = box.x + _bullet_width + space_width * 4
         if paragraph.first_line_indent and getattr(paragraph, "toc_role", None) != "title":
             # 列表项（段落以 bullet 字符开头，如 `•`/`?` 后跟空格）不应应用首行缩进，
             # 否则整个列表项（含 bullet 和后续文字/公式）会整体右移，与原文不对齐
@@ -1590,6 +1617,8 @@ class Typesetting:
                         break
             if not _is_list_item:
                 current_x += space_width * 4
+            # 若是列表项则不缩进（_is_list_item=True 时 current_x 保持 box.x）。
+            # 正文列对齐由上面无条件计算的 _list_content_x 在排版循环里处理。
         # 预计算每个位置到下一个可换行点（不含该断点）的累计宽度，把原 O(n²) 的
         # _get_width_before_next_break_point(typesetting_units[i:]) 降为 O(n)。
         # 从后往前：width_to_next_break[i] = 从 i 开始累加 unit.width 直到（不含）
@@ -1703,6 +1732,18 @@ class Typesetting:
                 if unit.is_space:
                     line_height = max(line_height, unit_height)
                     continue
+
+            # 列表项正文列对齐：bullet 后的正文对齐到计算出的正文列（恢复
+            # bullet→正文留白）。例：Page 408 图236 的 `LfiF1`/`Hxfq8` box 从
+            # bullet(x=92) 起、正文在 x=112，排版若不处理会把正文紧贴 bullet 排到
+            # x≈98；这里把 bullet 后第一个非空格字符对齐到正文列。
+            if _list_content_x is not None:
+                if i == 0:
+                    _passed_bullet = True
+                elif _passed_bullet and not unit.is_space:
+                    if current_x < _list_content_x:
+                        current_x = _list_content_x
+                    _passed_bullet = False
 
             # 放置当前单元
             relocated_unit = unit.relocate(current_x, current_y, scale)
