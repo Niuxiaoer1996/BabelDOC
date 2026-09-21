@@ -1260,3 +1260,43 @@
 - **上游价值**: LLM 对幂记号占位符前补 `^` 导致双 `^`，属上游普适缺陷（任何含幂记号的文档），可考虑
   提 PR。
 
+## 51. 跨段落合并分式分子分母 + 图236 第二点拼接回归 + 图235 第二点整体向上（2026-09-21，JESD209-5B Page 407/408）
+
+- **Commit**: `0acabce`（分支 `fix/p407-superscript-regression`，未 push）
+- **症状**（JESD209-5B，`_split_JESD209-5B-HJ` 子集 page[0]=407/page[1]=408）:
+  1. **图235 第二点分式"分子偏上"**：分式分子 `运行时间` 与分母 `2*计数` 被布局模型拆到**不同段落**
+     （图235 标 fallback_line，分子 cfej1 / 分母 Kb2b4 独立段，y 有 gap），`_merge_vertical_fractions`
+     只遍历单段落，找不到分母 → 分子单独渲染 yoff=+5.467 上移、离分数线太远；图236 同构分式标
+     plain text、分子分母同段 → 正常。
+  2. **图236 第二点拼接在第一点后面（回归）**：初版 `_merge_cross_paragraph_fractions` 把整个第二点
+     段（`tWCKosc(V) : ...=运行时间/2*计数`）吸收进第一点段，第二点与第一点渲染在同一行。
+  3. **图235 第二点内容整体向上 ~8pt**：跨段合并后分式 box 高 17.93pt，但换行行距只按第一点文本行
+     高度（~15pt）推进，第二点被上拉、几乎与第一点重叠。
+- **定位/根因**:
+  1. 分子/分母跨段落：图235 被布局模型标 fallback_line 且分子分母 y 有 gap（cfej1 y≥381.2 vs
+     Kb2b4 y≤379.2，gap≈2pt）→ threading 拆段；图236 标 plain text 且 y 连续 → 整段。
+  2. 拼接回归：`_merge_cross_paragraph_fractions` 的"纯公式段"判定用 `any(c.pdf_line is not None)`，
+     但图236 第二点段的文本（数学字体）已被分类为 pdf_formula 而非 pdf_line → 误判为"纯公式"，
+     整段被吸收（styles 阶段 para95 4WvfK 被并进 para94 oSr3A）。
+  3. 整体向上：`typesetting.py::_layout_typesetting_units` 换行行距 `max(font_size*scale*line_skip,
+     mode_height*line_skip, max_height*1.05)` 只看**当前行**（第一点文本）高度，不前瞻下一行高分式
+     （17.93pt）→ 第二点行距不足被上拉。另：分式 box 被分子尾随空格 `运行时间 ` 撑高 2.23pt
+     （空格无字形、visual_bbox 取整字符框高，CambriaMath 空格 y2=394.8），使 y_offset 更偏负。
+- **修复**:
+  1. 跨段落合并（`styles_and_formulas.py` 新增 `_merge_cross_paragraph_fractions`，在
+     `_merge_vertical_fractions` 开头调用）：把"**恰好一个公式**（1 个 composition 且为 pdf_formula）
+     且与某公式垂直分式对（`_is_vertical_fraction_pair`）+ x 重叠"的**分母段落**并入分子段落，
+     随后段内合并成整分式。图235 分母段（6DyrB，单公式）→ 合并；图236 第二点段（文本+分式，
+     多 composition）→ 排除（修复拼接回归）。
+  2. 行距下限（`typesetting.py`）：新增 `para_max_height = max(unit.height)*scale`（段落内最高
+     排版单元），换行行距下限追加 `para_max_height * line_skip`。正常文本段 `para_max_height≈font_size`
+     行距不变；仅含高公式段行距抬升，避免高分式行被上一行重叠。
+  3. 分式 box 空格撑高（`formular_helper.py::update_formula_data`）：高度计算新增本地
+     `_formula_height_char_ignored`（忽略空格，仍计入宽度）。**不改**共享的
+     `layout_helper.formular_height_ignore_char`（它在 `is_newline` 里使用，忽略空格会破坏换行检测）。
+- **验证**: 用户重跑确认图236 第二点恢复独立行、图235 第二点分式位置正常（不再整体向上）。
+- **风险控制**: 跨段合并限"单公式分母段"（排除完整列表项）；行距下限/空格高度均为条件式，正常
+  文本段与普通公式不受影响；`_is_vertical_fraction_pair` 同行 y_diff≈0 不满足垂直相邻，不会误并。
+- **上游价值**: 分子/分母被拆到不同段落、换行行距不前瞻高分式、空格撑高公式 box，均属上游普适
+  缺陷，可考虑提 PR。
+

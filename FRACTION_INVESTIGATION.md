@@ -47,12 +47,127 @@ Page 407 已验证完美（分子中心 202.6 / 分母中心 217.0，与原文�
    20.3pt，`process_page_offsets` 算 `y_offset` 得 -13.45，上标 `16` 往下掉 13pt。**已解决**（补丁49，
    `111ff85`，styles_and_formulas.py 把 `_remove_orphan_spaces` 提前到 `process_page_offsets` 之前）。
 
-## 二、Page 408（U9）— 未解决，排查中
+## 二、Page 408（U9）— 分式已解决(S24/S25)；下标问题修复中（待用户重跑确认）
 
 ### 现象（用户肉眼观察）
 图235、图236 下方各有两个无序列表项：
 - 列表项1：`OSC Match_temp : OSC Match_temp = [tWCK2DQ (T) – tWCKosc (T) – OSC offset_temp ]`
   - **下标问题**：`temp` 被翻译成中文"温度"，`Match_temp` 未作为完整下标保留。
+
+### 下标问题根因（2026-09-19 排查，方向已修正——TT2/TT6 都是公式字体，非"字体未识别"）
+> 先前的"TT2 普通字体未识别为公式"假设**错误**：TT2=`TimesNewRomanPSMT`、TT6=`MIKSPQ+CambriaMath`，
+> 两者都匹配公式字体名模式（`TimesNewRoman.*`/`Cambria.*`），**都是公式字体**。已撤销对应的代码改动。
+
+**真实现象（styles_and_formulas.json / translate_tracking.json 确认）**：
+- **冒号前**的 `Match_volt`（comp2, x=131）：完整公式 `{v5}`，字符 `Match_volt ` 含下划线，**正常**。
+- **冒号后**的第二个 `Match_volt`：被**拆分损坏**——`Match`→公式 `{v12}`，`volt`→**TEXT**（comp8），
+  下划线 `_` 被抽到独立的 comp15 `_ `；翻译后 `volt`→"电压"。
+- **`offset_volt`**：`offset`→公式（comp12），`volt`→**TEXT**（comp13）→"电压"。
+- temp 版（para 83/84/86）：第二个 `Match`→公式（comp6），`temp` 被拆到 para 84 comp0（TEXT）、
+  para 86 comp0（TEXT）→"温度"。
+- **二次损坏**：`_merge_vertical_fractions`（补丁47）把冒号后 `Match`+两个 `(V)`+`_` 过度合并成
+  comp7 `(V) (V)_  Match`（box x=193-345 横跨整行）。
+- `volt`/`temp`→TEXT 的拆分发生在**翻译前**的公式分类/分组阶段（translate_tracking 的 input 已显示
+  `{v12}=Match` + `volt`(text)），`_merge_vertical_fractions` 在其后（翻译后）进一步过度合并。
+- **确切拆分机制待定**：`volt` 是 TT6 公式字体、非 plain-inline 字符，静态分析看 `is_in_formula_font`
+  应为 True，但实际被拆成 TEXT。需加 debug 插桩到 `_classify_characters_in_composition`/
+  `_group_classified_characters` 输出 para 102 逐字符公式 tag，再让用户重跑确认。
+
+### 【根因确认 2026-09-20】下划线 `_` 的 visual_bbox 异常 → 行聚类拆行 + 公式 box 污染
+经 debug（paragraph_finder.json + styles_and_formulas.json + classify_debug.txt）最终确认，图235（temp 版）
+两个剩余问题的**共同根因**是 **TT6(CambriaMath) 下划线 `_` 字符的 `visual_bbox` 异常**：
+其字形包围盒（glyph bbox）被报在放置框上方约 16pt（vis_y≈388.6，而 box_y≈404.5）。
+
+**数据证据（para Y7gq4，temp 版列表项）**：
+- paragraph_finder.json：该行被拆成 3 个 LINE 片段，拆分点正好都在异常 `_` 处：
+  - comp0 `OSCMatch_temp :   OSCMatch`（第2个 `Match` 结束，缺 `_`）
+  - comp1 `temp = [tWCK2DQ(T) –tWCKosc(T) – OSCoffset_`（以 `temp` 开头、`offset_` 结尾）
+  - comp2 `temp]`
+- 第2个 `Match` 的下划线 `_`（x≈212.8）形成独立 fallback_line 段落 `gw5d3`（孤立 `_`），
+  因 vis_y=388.6 与主字符行（vis_y=404.5）不重叠，被 `extract_char.process_page_chars_to_lines`
+  （用 visual_bbox 聚类）聚成独立"行"，后成独立段落，未并入列表项 → **第2个 `Match_temp` 丢下划线**。
+- `offset_temp`（styles comp13）本身是完整一个公式，但其 box 被 `_` 的 vis_y=388.6 撑高
+  （y 388.5-409，高 20pt），使 `process_page_offsets` 的 y_offset 算错 → **没落在 OSC 下方**。
+- 对比：冒号前第1个 `Match_temp` 的 `_`（x=148，TT2）vis_y=402.1 正常 → 未拆行、下划线完整。
+
+**根因修复（il_creater_active.py，frontend，实际主路径）**：
+- 注意：`il_creater_active.py`（ActiveILCreater）才是实际使用的 PDF 解析路径，
+  `il_creater.py`（ILCreater）是遗留兼容工具（native_parse.py/active_parse_runtime.py 走 active 路径）。
+  最初误改在 `il_creater.py`，验证无效后已 `git checkout` 回退，改到 `il_creater_active.py`。
+- 【2026-09-20 二轮 debug 精确定位】真正根因是 **CambriaMath 字体的 `font.descent` 异常**，
+  而非字形包围盒覆盖：
+  - debug（underscore_dbg.txt）显示：异常 `_` 的 `descent≈-15.97pt`（font.descent≈-2465），
+    而正常 `_`/其他字符仅 `-1.8~-2.0pt`（font.descent≈-247）。
+  - `project_native_char` 默认 visual_bbox = `box + descent`（line 1365-1370）。`descent=-15.97`
+    使 `_` 的 visual_bbox 上移约 16pt（vis_y 388.5 vs box_y 404.5）。
+  - 为什么只有 `_` 受影响：正常字符（Match/temp）字形墨迹面积大（volume>1），被
+    `char_bounding_box` 字形包围盒覆盖（得到正确 visual_bbox）；而 `_` 是细线下划线、
+    字形包围盒体积小（volume≤1），**不触发字形覆盖，走默认 `box+descent`**，被异常 descent 拉高。
+- **修复**（line 1371-1386）：默认 visual_bbox（`box+descent`）计算后，若其与字符放置框
+  `bbox` 在 y 轴**无重叠**（descent 异常、visual_bbox 与 bbox 分离），回退用 `bbox` 本身作为
+  visual_bbox。正常 descent 时 `box+descent` 与 bbox 必然重叠（仅下移约 2pt），不受影响。
+  这是通用原则修复（非 `_` 特判）。一处修复同时解决：聚类拆行（丢下划线）+ 公式 box 污染
+  （offset_temp 定位）。
+- 注：曾尝试在字形包围盒覆盖块加"y 重叠守卫"，但 debug 证明 `_` 的 in_volume=False 根本不走
+  该块，故该守卫无效已回退。真正的修复在默认 descent 路径。
+
+### 【2026-09-20 三】图235 第二点分式"分子偏上"根因 = 分子分母被拆到不同段落（非回归）
+用户反馈：图235 第二点（`tWCKosc(T) : Run Time/2*Count`）"分子+正文整体偏上，分母/分数线正常"；
+图236 第二点正常。**经对比备份与当前两轮 styles/typsetting 数据完全相同**——descent 修复**没有**
+改变分式渲染，故"偏上"是长期存在、非本轮引入的回归（用户可能此前未细看第二点）。
+
+**根因（create_il / paragraph_finder / styles_and_formulas 三层确认）**：
+- 原始（create_il）：图235 分式是标准垂直分式——分子（Run Time）x=249.6-282 y=387.8-394.8、
+  分母（2*Count）x=252-282 y=376.9-383.9，x 重叠、垂直相邻。
+- paragraph_finder 阶段：**图235 分式被拆成 3 个段落**（都标 fallback_line）：
+  - cfej1（主段）：`OSCMatch_temp : ... tWCKosc(T) : ... 分子`（分子 y=388）
+  - Kb2b4：**分母**（y=377）——独立成段
+  - ykn4h：bullet `?`
+- 图236（aWy7d）分式是 **plain text 整段**：分子（y=102）分母（y=91-96）**同一段落**。
+- styles_and_formulas `_merge_vertical_fractions` 只遍历**单个段落内**的 composition，故：
+  - 图236 分子分母同段 → 合并成功 → 分式整体 yoff=-3.99，正常居中。
+  - 图235 分子（cfej1）分母（Kb2b4）**跨段落** → 无法合并 → 分子单独渲染 yoff=+5.467（上移），
+    分子离分数线约 10pt（236 仅 6pt），即"分子偏上"。
+
+**关键差异**：图235 被布局模型标为 fallback_line 且分子分母 y 有 gap（cfej1 y≥381.2 vs Kb2b4
+y≤379.2，gap≈2pt）→ threading 拆段；图236 被标 plain text 且 y 连续 → 整段。
+
+**修复方向（已实现 方案A：跨段落合并成公式）**：
+- `styles_and_formulas.py` 新增 `_merge_cross_paragraph_fractions(page)`，在 `_merge_vertical_fractions`
+  开头调用：扫描所有段落，把"**恰好一个公式**的分母段落（无普通文本行）+ 与某公式垂直分式对
+  （`_is_vertical_fraction_pair`）+ x 重叠"的**分母段落**并入分子段落，删除原分母段落。
+  随后 `_merge_vertical_fractions` 就能在段内把分子分母合并成一个公式（整体居中，不再偏上）。
+- 验证：235 分式分子 box=(249.8,387.8,282,394.8)、分母 box=(252.4,376.9,279.8,381.6)，x 重叠、
+  y_diff=12.05、avg_h=5.85，`2.925≤12.05≤14.6` → `_is_vertical_fraction_pair=True`。合并条件成立。
+  235 分母段（6DyrB）ncomp=1 单公式 → 通过。
+- **回归修正（236 第二点拼接第一点，2026-09-21）**：初始版"纯公式段"判定用
+  `any(c.pdf_line is not None)`，但图236 第二点段（4WvfK，`tWCKosc(V) : ...=运行时间/2*计数`）
+  的文本在 styles 阶段已被分类为 pdf_formula（数学字体），非 pdf_line → 误判为"纯公式"，把**整个
+  第二点段**吸收进第一点段 → 第二点拼接在第一点后面。**已改为"恰好 1 个 composition 且为
+  pdf_formula"**：4WvfK 有文本+分式=多 composition → 排除；6DyrB 单公式 → 照常合并。
+- 安全性：只合并"单个公式分母段"，且须垂直分式对；Page 407 分式分子分母本就在同段，找不到跨段
+  对，不受影响。同行公式 y_diff≈0 不满足垂直相邻，不会误并。
+
+**预期**：重跑后图235 整行应为单一 cluster → 单 fallback_line → `Match_temp`/`offset_temp` 下划线完整，
+`offset_temp` 正常作为 OSC 的下标渲染。
+
+### 【2026-09-21 四】图235 第二点"整体向上"根因 = 换行行距未考虑分式高度（typesetting）
+分式跨段合并后（comp22 box=(249.8,376.9,282,394.8)，高 17.93pt），图235 第二点仍"整体向上 ~8pt"。
+经 typesetting 追踪：
+- **根因**：`typesetting.py::_layout_typesetting_units` 换行时（line ~1717）行距按**当前行**（第一点
+  文本行，高 ~10pt）`max(font_size*scale*line_skip, mode_height*line_skip, max_height*1.05)≈15pt` 推进，
+  **不前瞻下一行**的高分式（17.93pt）→ 第二点被上拉 ~8pt，与第一点几乎重叠（原文本两行间距 23pt）。
+- **修复**：新增 `para_max_height = max(unit.height)*scale`（段落内最高排版单元），行距下限追加
+  `para_max_height * line_skip`。正常文本段 `para_max_height≈font_size` → 行距不变；仅含高公式段落
+  的行距被抬升，避免高分式行被上一行重叠。
+- **次要根因（分式 box 被空格撑高 2.23pt）**：分式分子 `运行时间 `（尾随空格）的空格无字形，
+  visual_bbox 取整字符框高（CambriaMath 空格 y2=394.8）→ 分式 box 由 ~15.7 涨到 17.93pt，
+  y_offset 更偏负。**修复**：`formular_helper.py::update_formula_data` 高度计算新增本地
+  `_formula_height_char_ignored`（忽略空格，仍计入宽度）。注意不改共享的
+  `layout_helper.formular_height_ignore_char`（它在 `is_newline` 里使用，忽略空格会破坏换行检测）。
+- 两修复均为条件式：只影响含高公式段/含空格公式，正常文本与普通公式不受影响。
+
+
 - 列表项2：`tWCKosc(T) : tWCKosc（T）= Run Time/2*Count`
   - **分式问题**：分子 `Run Time` + 分数线被错误前置到最前，`tWCKosc（T）= ` 和分母 `2*Count`
     留在后面，分式被拆开错位。整行还有"位置偏上"问题（可后调）。
@@ -126,11 +241,13 @@ debug 日志确认 threading 行为（发现分子分母本就在同一行，见
 ### 待办
 - [x] **Page 407 回归**（已解决，见上文）：`2^16` → `2^^16`（双 `^`）=补丁50 `9bb7192`；
       最后一行第一个 `2^16` 的 `16` 上标位置错乱=补丁49 `111ff85`。
-- [ ] 确认图235 vs 图236 渲染差异根因。
-- [ ] 方案A 实验：改 threading 分行，验证分式能否合并且不影响全局；不行则回退方案B。
-- [ ] 方案B 兜底：`_merge_vertical_fractions` 跨 composition 合并分子分母。
-- [ ] 列表项1 下标问题：`temp` 翻译成"温度"、`Match_temp` 未作整体下标。
-- [ ] 整行"位置偏上"问题（可后调）。
+- [x] 图235 第二点分式"分子偏上"=跨段落合并（方案A）已实现 + 图236 拼接回归已修（单公式守卫）。
+- [x] 图235 第二点"整体向上 ~8pt"=typesetting 行距未考虑分式高度，已修（para_max_height 行距下限）
+      + 分式 box 空格撑高已修（formular_helper 高度忽略空格）。
+- [ ] 列表项1 下标问题（排查中，方向已修正）：`temp`/`volt` 翻译成"温度/电压"、`Match_temp` 未作整体
+      下标。真因=冒号后 `Match_volt`/`offset_volt`（及 temp 版）被拆分损坏（`volt`/`temp`→TEXT，
+      下划线被抽走），非字体未识别。待加 debug 插桩确认拆分机制。
+- [ ] 图236 `OSC`→"振荡器"翻译术语问题（未处理）。
 - [ ] 408 完全解决后统一更新 LOCAL_PATCHES.md / HISTORY.md / README 问题总表。
 
 ### 附：Page 407 vs Page 408 差异总结
