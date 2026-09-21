@@ -1534,6 +1534,13 @@ class Typesetting:
                 # 如果没有众数（所有值都出现相同次数），则使用平均值
                 avg_height = sum(unit_heights) / len(unit_heights) * scale
 
+        # 段落内最高排版单元（未缩放）。用于换行行距下限：当某行后紧跟含较高公式
+        # （如垂直分式 `运行时间/2*计数`，box 高 ~16pt）的下一行时，仅按当前行文本
+        # 高度（font_size*line_skip≈15pt）推进会把下一行上移、与上一行重叠（Page 408
+        # 图235 第二点分式"整体向上"根因）。以段落最高单元为行距下限可避免此重叠。
+        para_max_height = (
+            max((unit.height for unit in typesetting_units), default=0.0) * scale
+        )
         # 初始化位置为右上角，并减去一个平均行高
         current_x = box.x
         current_y = box.y2 - avg_height
@@ -1718,6 +1725,7 @@ class Typesetting:
                     font_size * scale * line_skip,
                     mode_height * line_skip,
                     max_height * 1.05,
+                    para_max_height * line_skip,
                 )
                 line_ys.append(current_y)
                 line_height = 0.0

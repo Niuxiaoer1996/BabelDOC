@@ -1368,6 +1368,25 @@ class ActiveILCreater:
                 x2=char.bbox[2],
                 y2=char.bbox[3] + descent,
             )
+            # 钳制异常 descent：个别字体的 descent（font metric）异常偏大（如
+            # CambriaMath 下划线 `_`，font.descent≈-2465 → descent≈-15.97pt，而正常
+            # 字体仅 -2pt 左右），使 `box+descent` 得到的 visual_bbox 与字符放置框
+            # bbox 在 y 轴完全分离（上移约 16pt）。该异常 visual_bbox 会让：
+            #   1) 行聚类（extract_char 用 visual_bbox）把 `_` 单独聚成一条线 →
+            #      孤立 fallback_line 段落，`Match_temp` 下划线丢失变 `Matchtemp`；
+            #   2) 公式 box 被该 visual_bbox 撑高 → process_page_offsets 的 y_offset
+            #      算错 → `offset_temp` 没落在 OSC 下方。
+            # 当 `box+descent` 与 bbox 在 y 轴无重叠（descent 异常）时，回退用 bbox 本身
+            # 作为 visual_bbox（下划线墨迹本就在基线附近，descent 的"下探"意义不适用）。
+            if not (
+                visual_bbox.y2 >= bbox.y - 0.5 and bbox.y2 >= visual_bbox.y - 0.5
+            ):
+                visual_bbox = il_version_1.Box(
+                    x=char.bbox[0],
+                    y=char.bbox[1],
+                    x2=char.bbox[2],
+                    y2=char.bbox[3],
+                )
         visual_bbox = il_version_1.VisualBbox(box=visual_bbox)
         pdf_style = il_version_1.PdfStyle(
             font_id=char.aw_font_id,

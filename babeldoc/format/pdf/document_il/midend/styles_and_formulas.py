@@ -446,6 +446,7 @@ class StylesAndFormulas:
         first_is_bullet_so_far: bool,
         line_index: int,
         prev_char: PdfCharacter | None = None,
+        prev_line_corner_mark: bool = False,
     ) -> tuple[list[tuple[PdfCharacter, bool]], bool]:
         """
         Phase 1: Classify every character in a composition as either formula or text.
@@ -460,7 +461,15 @@ class StylesAndFormulas:
 
         first_is_bullet = first_is_bullet_so_far
         in_formula_state = False
-        in_corner_mark_state = False
+        # 同行被拆成多个水平 LINE composition（如 Page 407 图235 列表项 `OSCMatch_temp : ...`
+        # 被拆成 `OSCMatch_temp : OSCMatch` + `temp = [...]` + `temp]` 三个水平片段，主文本
+        # 都在同一 y）时，`Match`(前一 LINE 末尾)与 `temp`(后一 LINE 开头)本是同一个下标
+        # 公式 `Match_temp`。若此处重置 `in_corner_mark_state=False`，`temp`（行首）就
+        # 不延续 `Match` 的角标状态，被当普通文本翻译成"温度"。故继承上一 LINE 末尾是否
+        # 角标（prev_line_corner_mark），使行首续接字符能走角标续接分支（font_size < prev*1.1）。
+        # 安全性：仅当上一 LINE 末尾确实是角标、且当前字符与它同行（_cross_guard）才延续；
+        # in_corner_mark_state 每字符末尾按实际 is_corner_mark 更新，首个非角标字符后即复位。
+        in_corner_mark_state = prev_line_corner_mark
         corner_mark_info = []
 
         # Determine the `is_formula` tag for each character
@@ -522,8 +531,15 @@ class StylesAndFormulas:
                     previous_char is not None
                     and not isspace
                     and not prev_is_space
-                    and not first_is_bullet
-                    # 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
+                    # 字号角标起始检测不再被 first_is_bullet 整行抑制：
+                    # bullet 列表项（如 Page 408 `• OSC Match_volt : ...`）内 `Match_volt`
+                    # 的 `Match`(6.48) 相对前导 `OSC`(9.96) 字号明显变小，是真实下标；
+                    # 但 TT2/TT6 是"非公式字体"，只能靠角标检测识别为公式。原 `not
+                    # first_is_bullet` 因 first_is_bullet 粘性整行持续，把整个 bullet 项
+                    # 的字号角标都抑制了，导致 `Match_volt`/`offset_volt` 被当普通文本翻译
+                    # （`temp`/`volt`→"温度/电压"）。去掉该抑制后，bullet 后紧跟的空格仍由
+                    # `not prev_is_space` 保证不误触发（bullet 后首词前是空格，prev_is_space=True）。
+                    # 与 y 偏移角标路径（本就 bullet 豁免，见下）行为一致。
                     and char.pdf_style.font_size
                     < previous_char.pdf_style.font_size * 0.79
                     and not in_corner_mark_state
@@ -542,8 +558,8 @@ class StylesAndFormulas:
                     and next_char is not None
                     and not isspace
                     and not prev_is_space
-                    and not first_is_bullet
-                    # 当前字符字体大小明显小于下一个字符，判定为角标
+                    # 同上：去掉 first_is_bullet 抑制，让 bullet 列表项开头的小字号也能
+                    # 被识别为角标（真实下标）。`not prev_is_space` 已保证不误触发。
                     and char.pdf_style.font_size < next_char.pdf_style.font_size * 0.79
                     and not in_corner_mark_state
                 )
@@ -709,6 +725,9 @@ class StylesAndFormulas:
             # 跨 composition 的角标检测参考：上一 composition 的最后一个字符
             # （layout 模型可能把 "Adc" 拆成 A + dc 两个 composition，dc 需与 A 比较基线/字号）
             prev_line_last_char: PdfCharacter | None = None
+            # 上一 composition 末尾字符是否为角标：同一行被拆成多个水平片段时，
+            # 行首的下标续接（如 `Match` + `temp` = `Match_temp`）需延续角标状态。
+            prev_line_corner_mark = False
 
             for line_index, composition in enumerate(
                 paragraph.pdf_paragraph_composition
@@ -722,10 +741,16 @@ class StylesAndFormulas:
                     first_is_bullet,
                     line_index,
                     prev_line_last_char,
+                    prev_line_corner_mark,
                 )
                 _prev_line = composition.pdf_line
                 if _prev_line and _prev_line.pdf_character:
                     prev_line_last_char = _prev_line.pdf_character[-1]
+                    prev_line_corner_mark = bool(
+                        tagged_chars
+                        and tagged_chars[-1][2]  # 末字符 is_corner_mark
+                        and prev_line_last_char.pdf_character_id is not None
+                    )
 
                 if not tagged_chars:
                     new_paragraph_compositions.append(composition)
@@ -1274,15 +1299,95 @@ class StylesAndFormulas:
             return False
         return 0.5 * avg_h <= y_diff <= 2.5 * avg_h
 
+    def _merge_cross_paragraph_fractions(self, page: Page):
+        """跨段落合并垂直分式：把被拆到独立段落的"分母段落"并入"分子段落"。
+
+        背景：`_merge_vertical_fractions` 只遍历单个段落内的 composition。若布局模型
+        把垂直分式的分子与分母拆到不同段落（如 Page 408 图235 分子在段落 A、分母在
+        独立段落 B，均标 fallback_line），段内扫描永远找不到分母，分式合并不了，
+        分子单独渲染偏上。此处把分母段落并入分子段落，使段内扫描能合并成一个公式。
+
+        保守条件（避免误并正常换行的 fallback_line 或完整列表项）：
+        - 分母段落 B 必须是**单个纯公式**（恰好 1 个 composition 且为 pdf_formula，
+          无普通文本行）；多 composition 的段落（如含文本的完整列表项）绝不整段吸收，
+          否则会把整个第二点拼到第一点后面；
+        - B 中这个公式与 A 中某公式是垂直分式对（`_is_vertical_fraction_pair`）；
+        - 合并后 B 的 composition 追加到 A。
+        """
+        paras = page.pdf_paragraph
+        if not paras or len(paras) < 2:
+            return
+        i = 0
+        while i < len(paras):
+            pa = paras[i]
+            comps_a = pa.pdf_paragraph_composition
+            if not comps_a:
+                i += 1
+                continue
+            merged_any = False
+            for fa_comp in comps_a:
+                if fa_comp.pdf_formula is None:
+                    continue
+                fa = fa_comp.pdf_formula
+                if fa.box is None:
+                    continue
+                j = 0
+                while j < len(paras):
+                    if i == j:
+                        j += 1
+                        continue
+                    pb = paras[j]
+                    comps_b = pb.pdf_paragraph_composition
+                    # 分母段须为**单个纯公式**（无普通文本行、无多个 composition）。
+                    # 只吸收"恰好一个公式"的独立分母段落（如 Page 408 图235 的分母
+                    # `2*Count`，paragraph_finder 里是单 LINE → 分类后单 FORMULA）。
+                    # 多 composition 的段落（如 Page 408 图236 第二点 `tWCKosc(V) :
+                    # ... = 运行时间/2*计数`，含文本+分式）是完整列表项，绝不能整段吸收，
+                    # 否则会把整个第二点拼到第一点后面（回归）。单公式限制可同时排除它。
+                    if (
+                        len(comps_b) != 1
+                        or comps_b[0].pdf_formula is None
+                    ):
+                        j += 1
+                        continue
+                    found = False
+                    for cb in comps_b:
+                        if (
+                            cb.pdf_formula is not None
+                            and self._is_vertical_fraction_pair(fa, cb.pdf_formula)
+                        ):
+                            found = True
+                            break
+                    if found:
+                        pa.pdf_paragraph_composition.extend(comps_b)
+                        del paras[j]
+                        for _c in pa.pdf_paragraph_composition:
+                            if _c.pdf_formula is not None:
+                                self.update_formula_data(_c.pdf_formula)
+                        merged_any = True
+                        break
+                    j += 1
+                if merged_any:
+                    break
+            if merged_any:
+                continue
+            i += 1
+
     def _merge_vertical_fractions(self, page: Page):
         """把垂直排列的分式（分子/分母公式 + 中间的符号文本）合并成一个 PdfFormula。
 
-        背景：分式分子/分母（数学字体）被普通字体的 `=`/`(`/`)`/`.` 拆成多个独立公式，
+        背景：        分式分子/分母（数学字体）被普通字体的 `=`/`(`/`)`/`.` 拆成多个独立公式，
         relocate 时各公式水平排列导致塌陷。这里把"垂直相邻的分子公式 + 符号文本 + 分母公式"
         的所有字符合并成一个公式，relocate 会用各字符 rel_y 保留垂直位置，分式不塌陷。
         """
         if not page.pdf_paragraph:
             return
+        # 跨段落预处理：垂直分式的分子与分母可能被 paragraph_finder 拆到不同段落
+        # （如 Page 408 图235 分式分子在段落 A、分母在段落 B，布局模型标 fallback_line
+        # 且分子分母 y 有 gap，threading 拆段）。若不合并，_merge_vertical_fractions
+        # 无法在单段落内找到分母 → 分子单独渲染、y_offset 偏大 → 分子离分数线太远（偏上）。
+        # 此处把"分母段落（纯公式）+ 垂直相邻 + x 重叠"并入分子段落，使下方段内合并生效。
+        self._merge_cross_paragraph_fractions(page)
         for paragraph in page.pdf_paragraph:
             comps = paragraph.pdf_paragraph_composition
             if not comps:

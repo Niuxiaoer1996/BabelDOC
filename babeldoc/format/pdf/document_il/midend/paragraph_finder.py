@@ -936,7 +936,18 @@ class ParagraphFinder:
                     same_row.append(p)
             # 同一行有 >= 2 个其他短段落 -> 表格行
             if len(same_row) >= 2:
-                para.in_table_layout = True
+                # 排除无序/有序列表项：若该行含以 bullet/编号开头的段落，则这行是
+                # 列表碎片而非表格单元格行。布局模型常把列表项拆成多个短 fallback_line
+                # 段落（如 Page 407 图235 的 `• OSC Match_temp : ...` 被拆成 `•`/
+                # `OSCMatch_temp : OSCMatch`/`temp = [...]`/`temp]` 等，都 <30 字符且
+                # 同一行），满足"同行多短段落"特征，若被误标为表格行 in_table_layout=True，
+                # 会阻断 merge_title_caption_and_table_fragments 把它们合并回一段。
+                row_is_list = any(
+                    self._paragraph_is_list_item_start(p)
+                    for p in ([para] + same_row)
+                )
+                if not row_is_list:
+                    para.in_table_layout = True
 
     # 参考文献标题（大小写不敏感，允许行尾空白）
     # 仅匹配复数形式 REFERENCES/References，不匹配单数 Reference
@@ -1247,14 +1258,26 @@ class ParagraphFinder:
                 ):
                     continue
                 b_cy = (b.box.y + b.box.y2) / 2
-                if abs(a_cy - b_cy) > 4.0:  # 同一行
+                a_label = a.layout_label or ""
+                b_label = b.layout_label or ""
+                # fallback_line 链（a、b 均 fallback_line，同一列表项被拆成多段）：
+                # 片段含下标字符时 box 会因下标 y 位置不同被撑高（如 Page 407 图235 的
+                # `temp = [tWCK2DQ(T)...OSCoffset_`，box y 388.7-412.0 高 23pt，而相邻
+                # `OSCMatch_temp : OSCMatch` 只有 10.7pt），中心点相差 6.8pt > 4.0 被判
+                # "不同行"而漏合并。对 fallback_line 链改用 y 重叠判断（两 box 在 y 轴有
+                # 交集即视为同一行），而非中心点距离。
+                if a_label == "fallback_line" and b_label == "fallback_line":
+                    # y 重叠判断（容差 1pt）
+                    if not (
+                        a.box.y2 >= b.box.y - 1.0 and b.box.y2 >= a.box.y - 1.0
+                    ):
+                        continue
+                elif abs(a_cy - b_cy) > 4.0:  # 同一行
                     continue
                 h_gap = b.box.x - a.box.x2  # b 紧贴 a 右侧
                 first_ch = self._paragraph_first_char(b)
                 if not first_ch:
                     continue
-                a_label = a.layout_label or ""
-                b_label = b.layout_label or ""
                 is_lower_cont = first_ch.islower()
                 # 括号水平续接：a 以未闭合的左括号结尾（如 "(below 0.2 × VDDQ"）、
                 # b 以右括号开头（如 ") before..."），且两者同一行水平相邻。版面模型
@@ -1270,12 +1293,23 @@ class ParagraphFinder:
                 # 长标题横切处 box 常轻微重叠 1-2pt（如 "2.6. Research...T" + "echnology"），
                 # 且续接片段可能以 "." 开头（如 "3" + ".3.1. Importance..."）。对标题对
                 # 放宽 h_gap 下限与首字符限制，避免标题被切块。
+                # fallback_line 链（a、b 均为 fallback_line 且同一行水平相邻）：布局模型
+                # 对某些页（如 Page 407 图235 列表项）把整行拆成多个 fallback_line 片段，
+                # 中间还夹孤立下标分隔符 `_`（如 `Match` + `_` + `temp` = `Match_temp`）。
+                # 这些片段本应合并成一个段落（Page 408 同构列表项被识别成 plain text 整段）。
+                # 对 fallback_line 对放宽首字符（允许 `_`）与长度上限（合并后仍可续接），
+                # 否则 `Match_temp`/`offset_temp` 被拆开、`temp` 被当普通文本翻译成"温度"。
+                is_fb_chain = a_label == "fallback_line" and b_label == "fallback_line"
                 is_title_pair = (
                     a_label in title_like
                     and b_label in title_like
-                    and (first_ch.isalpha() or first_ch == ".")
-                    and len((a.unicode or "")) <= 60
-                    and len((b.unicode or "")) <= 80
+                    and (
+                        first_ch.isalpha()
+                        or first_ch == "."
+                        or (is_fb_chain and first_ch == "_")
+                    )
+                    and len((a.unicode or "")) <= (200 if is_fb_chain else 60)
+                    and len((b.unicode or "")) <= (200 if is_fb_chain else 80)
                 )
                 if is_title_pair:
                     # 标题对允许轻微 x 重叠（h_gap 到 -2.0）
@@ -1714,7 +1748,6 @@ class ParagraphFinder:
         PDF bounding box. This helps use more accurate layout information when available.
         """
         visual_box = char.visual_bbox.box
-        return visual_box.y, visual_box.y2
         pdf_box = char.box
         if calculate_iou_for_boxes(visual_box, pdf_box) >= 0.5:
             return visual_box.y, visual_box.y2

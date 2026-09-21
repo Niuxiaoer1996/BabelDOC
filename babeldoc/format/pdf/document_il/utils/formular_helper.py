@@ -309,19 +309,27 @@ def is_formulas_font(font_name: str, formular_font_pattern: str | None) -> bool:
     return False
 
 
+def _formula_height_char_ignored(char):
+    # 空格不计入公式 box 高度：空格无字形，其 visual_bbox 取整字符框高度（无 descent
+    # 削减，如 CambriaMath 空格 y2=394.8），会让合并后的分式 box 被撑高（Page 408
+    # 图235 分子 `运行时间 ` 尾随空格使分式 box 由 ~15.7 涨到 ~17.9pt），进而使
+    # y_offset 偏负、分式整体偏高。高度上忽略空格（仍计入宽度）可反映真实字形范围。
+    return formular_height_ignore_char(char) or char.char_unicode == " "
+
+
 def update_formula_data(formula: PdfFormula):
     min_x = min(char.visual_bbox.box.x for char in formula.pdf_character)
     max_x = max(char.visual_bbox.box.x2 for char in formula.pdf_character)
-    if not all(map(formular_height_ignore_char, formula.pdf_character)):
+    if not all(map(_formula_height_char_ignored, formula.pdf_character)):
         min_y = min(
             char.visual_bbox.box.y
             for char in formula.pdf_character
-            if not formular_height_ignore_char(char)
+            if not _formula_height_char_ignored(char)
         )
         max_y = max(
             char.visual_bbox.box.y2
             for char in formula.pdf_character
-            if not formular_height_ignore_char(char)
+            if not _formula_height_char_ignored(char)
         )
     else:
         min_y = min(char.visual_bbox.box.y for char in formula.pdf_character)
