@@ -244,11 +244,14 @@ debug 日志确认 threading 行为（发现分子分母本就在同一行，见
 - [x] 图235 第二点分式"分子偏上"=跨段落合并（方案A）已实现 + 图236 拼接回归已修（单公式守卫）。
 - [x] 图235 第二点"整体向上 ~8pt"=typesetting 行距未考虑分式高度，已修（para_max_height 行距下限）
       + 分式 box 空格撑高已修（formular_helper 高度忽略空格）。
-- [ ] 列表项1 下标问题（排查中，方向已修正）：`temp`/`volt` 翻译成"温度/电压"、`Match_temp` 未作整体
-      下标。真因=冒号后 `Match_volt`/`offset_volt`（及 temp 版）被拆分损坏（`volt`/`temp`→TEXT，
-      下划线被抽走），非字体未识别。待加 debug 插桩确认拆分机制。
-- [ ] 图236 `OSC`→"振荡器"翻译术语问题（未处理）。
-- [ ] 408 完全解决后统一更新 LOCAL_PATCHES.md / HISTORY.md / README 问题总表。
+- [x] **列表项1 下标问题（temp/volt 译成"温度/电压"）已解决**：真因是 `_` 下划线 descent 异常导致
+      `Match_temp`/`offset_temp` 被拆行、`temp`/`volt` 被当普通文本。il_creater_active.py descent 钳制
+      + paragraph_finder fallback_line 链合并 + styles 角标续接后，`Match_temp`/`Match_volt`/
+      `offset_temp`/`offset_volt` 均作为完整公式保留（translate_tracking `formula_chars: Match_temp`/
+      `Match_volt`/`offset_volt`），不再翻译成"温度/电压"。用户重跑确认列表项与原文一致。
+- [x] **图236 `OSC` 保留为英文（不译成"振荡器"）已解决**：`OSC` 作为公式/标识符保留（输出含
+      `<style id='4'>OSC</style>`），未被翻译成"振荡器"。用户重跑确认与原文一致。
+- [x] 408 完全解决后统一更新 LOCAL_PATCHES.md / HISTORY.md / README 问题总表。
 
 ### 附：Page 407 vs Page 408 差异总结
 - **Page 407**：分式（分子+分母+分数线）原始是**一个公式**，`_merge_vertical_fractions` 只把等号
