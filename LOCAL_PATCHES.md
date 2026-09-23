@@ -1300,3 +1300,25 @@
 - **上游价值**: 分子/分母被拆到不同段落、换行行距不前瞻高分式、空格撑高公式 box，均属上游普适
   缺陷，可考虑提 PR。
 
+## 52. JESD82-542 abandon 误标正文翻译 + `~` 公式误判（2026-09-22，JESD82-542）
+
+- **Commit**: 分支 `fix/jesd82-542-render`，未 push
+- **症状**（JESD82-542）:
+  1. **正文段误标 abandon 未翻译**（Page163）："In I3C Basic mode, Bits [4]..." 正文段被版面模型
+     误标 `layout_label="abandon"`，补丁18 的 abandon 跳过翻译逻辑把它当页眉/页脚跳过 → 保持英文。
+  2. **`~` 被当公式跑段末**（Page195）："Page 3 RW60 ~ RW6E" 的 `~`（Unicode 类别 Sm）被
+     `is_formulas_start_char` 判为公式生成 `{v1}` 占位符；补丁41 把它从 `_PLAIN_INLINE_CHAR_RE` 移除
+     导致压制不生效，LLM 丢弃占位符后段末回填 `~`。
+- **定位/根因**:
+  1. abandon 段 box 在页面中部（y≈305，页高 792），非页眉/页脚（顶部 y>732 / 底部 y2<63）。
+  2. `~` 被 `is_formulas_start_char` 判为公式，`_PLAIN_INLINE_CHAR_RE`（补丁41 移除 `~`）压制不生效。
+- **修复**:
+  1. `paragraph_finder.py` 新增 `_correct_mislabeled_abandon_paragraphs`（`fix_overlapping_paragraphs`
+     后调用）：`layout_label=="abandon"` 且 box 位于页面中部（非顶部/底部 8% 边缘）的误标正文段改回
+     `plain text`，正常翻译；真页眉/页脚保持 abandon 跳过。
+  2. `styles_and_formulas.py` `_PLAIN_INLINE_CHAR_RE` 加回 `~`（`r"[0-9+\]\[=~]"`），使 `~` 作为
+     普通文本保留原位、不作为公式占位符。保留其它符号（× · − < > ± µ °）仍按公式保字形，避免
+     补丁41 的 µ→× 等回归。
+- **验证**: 用户重跑确认 abandon 正文段已翻译、段尾无 `~`。
+- **上游价值**: abandon 误标正文、`~` 公式误判，均属上游普适缺陷，可考虑提 PR。
+

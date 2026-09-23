@@ -399,6 +399,14 @@ class ParagraphFinder:
 
         self.fix_overlapping_paragraphs(page)
 
+        # 校正被版面模型误标为 abandon 的正文段落：
+        # 版面模型有时把页面中部（非页眉/页脚边缘）的正文框误分类为 "abandon"
+        # （页眉/页脚）。补丁18 在 il_translator / il_translator_llm_only 中无条件
+        # 跳过 abandon 段（保持原文 passthrough），导致这类正文段不被翻译。
+        # 这里把"页面中部的 abandon 段"改回 plain text，使其正常翻译；
+        # 真正的页眉/页脚（页面顶部/底部边缘）仍保持 abandon 跳过。
+        self._correct_mislabeled_abandon_paragraphs(page)
+
         # 第六步：对每一行的字符进行排序
         # self._sort_characters_in_lines(page)
 
@@ -2194,6 +2202,38 @@ class ParagraphFinder:
         # Check if bbox2 is contained in bbox1
         bbox2_in_bbox1 = bbox2.y >= bbox1.y and bbox2.y2 <= bbox1.y2
         return bbox1_in_bbox2 or bbox2_in_bbox1
+
+    def _correct_mislabeled_abandon_paragraphs(self, page: Page):
+        """把被版面模型误标为 abandon 的正文段落改回 plain text。
+
+        版面模型（DocLayout）对页眉/页脚的框打 "abandon" 类名，引擎据此在
+        il_translator / il_translator_llm_only 中跳过翻译（补丁18，保持原文
+        composition/行结构 passthrough）。但版面模型有时把**页面中部**的正文框
+        （非页眉/页脚）也误分类为 abandon，导致这些正文段被跳过翻译、保留英文。
+
+        这里按段落 box 的垂直位置区分：真正的页眉/页脚位于页面顶部/底部边缘，
+        页面中部的 abandon 段是误标正文，改回 "plain text" 使其正常翻译。
+        """
+        if not page.cropbox or not page.cropbox.box:
+            return
+        page_height = page.cropbox.box.y2 - page.cropbox.box.y
+        # 页眉/页脚边缘阈值：距页面顶部/底部约 8%（792pt 页高约 60pt）。
+        margin = page_height * 0.08
+        for paragraph in page.pdf_paragraph:
+            if (paragraph.layout_label or "") != "abandon":
+                continue
+            if paragraph.box is None:
+                continue
+            box = paragraph.box
+            near_top = box.y > page_height - margin      # 页面顶部（页眉）
+            near_bottom = box.y2 < margin                # 页面底部（页脚）
+            if not near_top and not near_bottom:
+                paragraph.layout_label = "plain text"
+                logger.info(
+                    "Corrected mislabeled abandon paragraph %s at y=%.1f to plain text.",
+                    paragraph.debug_id,
+                    box.y,
+                )
 
     def fix_overlapping_paragraphs(self, page: Page):
         """
